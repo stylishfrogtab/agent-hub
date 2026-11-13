@@ -35,6 +35,11 @@ PACKAGE = Path(__file__).resolve().parents[1] / "src" / "cli_agent_orchestrator"
 # A write path whose pre-image may be a lenient load, with the reason it is allowed.
 # Keys are "<path relative to src/>::<qualified function name>".
 ALLOWLIST: Dict[str, str] = {
+    "cli_agent_orchestrator/utils/usage_monitor.py::main": (
+        "The save branch parses a status-line payload from stdin and overwrites the "
+        "usage file with it. The bad-input ValueError is not a read of the file being "
+        "written, and the file holds no other settings, so nothing else is lost."
+    ),
     "cli_agent_orchestrator/services/config_service.py::_load_raw": (
         "The legacy config.json migration is a write on a read path. It is "
         "suppressed when the settings.json read actually failed (#737); only an "

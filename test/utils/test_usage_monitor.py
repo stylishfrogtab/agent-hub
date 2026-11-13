@@ -10,7 +10,9 @@ from cli_agent_orchestrator.utils.usage_monitor import (
 
 
 def test_extract_reads_both_windows():
-    payload = {"rate_limits": {"five_hour": {"used_percentage": 42}, "seven_day": {"used_percentage": 7.5}}}
+    payload = {
+        "rate_limits": {"five_hour": {"used_percentage": 42}, "seven_day": {"used_percentage": 7.5}}
+    }
     assert extract(payload) == {"five_hour": 42.0, "seven_day": 7.5}
 
 

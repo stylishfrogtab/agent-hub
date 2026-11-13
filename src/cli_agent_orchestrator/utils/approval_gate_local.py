@@ -61,13 +61,15 @@ def decide(request_id: str, decision: str, directory: Optional[Path] = None) -> 
 
 def read(request_id: str, directory: Optional[Path] = None) -> Dict[str, Any]:
     directory = directory or approvals_dir()
-    return json.loads(_path(request_id, directory).read_text())
+    record: Dict[str, Any] = json.loads(_path(request_id, directory).read_text())
+    return record
 
 
 def is_approved(request_id: str, directory: Optional[Path] = None) -> bool:
     """Fail closed: a missing or unreadable request counts as not approved."""
     try:
-        return read(request_id, directory)["status"] == APPROVED
+        approved: bool = read(request_id, directory)["status"] == APPROVED
+        return approved
     except (OSError, ValueError, KeyError):
         return False
 

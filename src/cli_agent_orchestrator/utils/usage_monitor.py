@@ -52,11 +52,11 @@ def save_status_line(payload: Dict[str, Any], path: Optional[Path] = None) -> No
 
 
 def read_usage(path: Optional[Path] = None) -> Dict[str, Optional[float]]:
-    """Latest saved percentages. An absent or unreadable file gives all None."""
+    """Latest saved percentages. A missing file gives all None; a corrupt one raises."""
     path = path or usage_file()
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {w: None for w in WINDOWS}
     return {w: _percent(data.get(w)) for w in WINDOWS}
 
@@ -81,13 +81,17 @@ def check(state_path: Optional[Path] = None, path: Optional[Path] = None) -> Lis
     state_path = state_path or usage_file().with_name("usage-alerts-sent.json")
     try:
         sent_all = json.loads(state_path.read_text())
-    except (OSError, ValueError):
-        sent_all = {}
+    except FileNotFoundError:
+        sent_all = (
+            {}
+        )  # only absence means "nothing sent yet"; a corrupt file must not be overwritten
     messages: List[str] = []
     for window, percent in read_usage(path).items():
         sent = list(sent_all.get(window, []))
         for threshold in due_alerts(window, percent, sent):
-            messages.append(f"Claude {window.replace('_', ' ')} usage at {percent:.0f}% (over {threshold}%)")
+            messages.append(
+                f"Claude {window.replace('_', ' ')} usage at {percent:.0f}% (over {threshold}%)"
+            )
         sent_all[window] = sent
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(sent_all))
@@ -96,7 +100,9 @@ def check(state_path: Optional[Path] = None, path: Optional[Path] = None) -> Lis
 
 def notify_macos(title: str, message: str) -> None:
     """Show a macOS notification. Arguments are passed as argv, never through a shell."""
-    script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
+    script = (
+        "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
+    )
     subprocess.run(["osascript", "-e", script, title, message], check=False)
 
 
