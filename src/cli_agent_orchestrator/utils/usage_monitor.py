@@ -52,11 +52,11 @@ def save_status_line(payload: Dict[str, Any], path: Optional[Path] = None) -> No
 
 
 def read_usage(path: Optional[Path] = None) -> Dict[str, Optional[float]]:
-    """Latest saved percentages. An absent or unreadable file gives all None."""
+    """Latest saved percentages. A missing file gives all None; a corrupt one raises."""
     path = path or usage_file()
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {w: None for w in WINDOWS}
     return {w: _percent(data.get(w)) for w in WINDOWS}
 
@@ -81,8 +81,10 @@ def check(state_path: Optional[Path] = None, path: Optional[Path] = None) -> Lis
     state_path = state_path or usage_file().with_name("usage-alerts-sent.json")
     try:
         sent_all = json.loads(state_path.read_text())
-    except (OSError, ValueError):
-        sent_all = {}
+    except FileNotFoundError:
+        sent_all = (
+            {}
+        )  # only absence means "nothing sent yet"; a corrupt file must not be overwritten
     messages: List[str] = []
     for window, percent in read_usage(path).items():
         sent = list(sent_all.get(window, []))
