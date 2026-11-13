@@ -1,0 +1,129 @@
+"""spawn_mode decides where a new terminal lands, and what a failure means."""
+
+from unittest.mock import MagicMock
+
+import pytest
+from libtmux.exc import LibTmuxException
+
+from cli_agent_orchestrator.backends.base import TerminalBackendError
+from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable, TmuxLookupError
+
+
+@pytest.fixture
+def client():
+    return MagicMock()
+
+
+class TestSpawnModeRouting:
+    def test_window_mode_is_the_default_and_never_splits(self, client):
+        TmuxBackend(client=client).create_window("ses", "coder-3", "tid")
+
+        client.create_window.assert_called_once()
+        client.create_pane.assert_not_called()
+
+    def test_pane_mode_splits_the_configured_window(self, client):
+        backend = TmuxBackend(client=client, spawn_mode="pane", pane_window="fleet")
+
+        backend.create_window("ses", "coder-3", "tid")
+
+        client.create_window.assert_not_called()
+        assert client.create_pane.call_args.args[:4] == ("ses", "fleet", "coder-3", "tid")
+
+    def test_the_configured_layout_reaches_the_client(self, client):
+        backend = TmuxBackend(client=client, spawn_mode="pane", pane_layout="even-vertical")
+
+        backend.create_window("ses", "coder-3", "tid")
+
+        assert client.create_pane.call_args.kwargs["pane_layout"] == "even-vertical"
+
+    def test_the_default_layout_is_tiled(self, client):
+        """It holds the most panes, which is what a fleet needs."""
+        TmuxBackend(client=client, spawn_mode="pane").create_window("ses", "coder-3", "tid")
+
+        assert client.create_pane.call_args.kwargs["pane_layout"] == "tiled"
+
+
+class TestFallbackIsNarrow:
+    def test_a_full_host_window_falls_back_to_a_window(self, client):
+        """tmux having no room is recoverable: the terminal still gets created."""
+        client.create_pane.side_effect = PaneSpawnUnavailable("no space for new pane")
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+
+        backend.create_window("ses", "coder-3", "tid")
+
+        client.create_window.assert_called_once()
+
+    def test_a_duplicate_name_does_not_fall_back(self, client):
+        """Falling back here would create a second terminal under one name."""
+        client.create_pane.side_effect = ValueError("Terminal 'coder-3' already exists")
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+
+        with pytest.raises(TerminalBackendError):
+            backend.create_window("ses", "coder-3", "tid")
+        client.create_window.assert_not_called()
+
+
+class TestWebAttach:
+    def test_window_mode_target_stays_a_pure_function(self, client):
+        backend = TmuxBackend(client=client)
+
+        argv = backend.prepare_web_attach("ses", "win")
+        link = argv.index("link-window")
+        assert argv[link + 1 : link + 3] == ["-s", "ses:win"]
+        client.web_view_attach_command.assert_not_called()
+
+    def test_pane_mode_asks_tmux_where_the_terminal_is(self, client):
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+
+        backend.prepare_web_attach("ses", "coder-3")
+
+        client.web_view_attach_command.assert_called_once_with("ses", "coder-3")
+
+    def test_window_mode_input_needs_no_focus(self, client):
+        backend = TmuxBackend(client=client)
+
+        argv, focus = backend.prepare_web_attach_input("ses", "win")
+
+        assert focus is None
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+        client.web_view_attach_plan.assert_not_called()
+
+    def test_pane_mode_argv_and_focus_come_from_one_lookup(self, client):
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+        client.web_view_attach_plan.return_value = (["tmux", "attach"], ("@2", "%4"))
+
+        assert backend.prepare_web_attach_input("ses", "coder-3") == (
+            ["tmux", "attach"],
+            ("@2", "%4"),
+        )
+        client.web_view_attach_plan.assert_called_once_with("ses", "coder-3")
+        backend.focus_web_input("%4")
+        client.select_pane.assert_called_once_with("%4")
+
+    @pytest.mark.parametrize(
+        "error",
+        [TmuxLookupError("listing failed to parse"), LibTmuxException("no server running")],
+    )
+    def test_pane_mode_lookup_failure_refuses_the_attach(self, client, error):
+        """'Could not tell' must not become 'needs no pane selected'."""
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+        client.web_view_attach_plan.side_effect = error
+
+        with pytest.raises(TerminalBackendError):
+            backend.prepare_web_attach_input("ses", "coder-3")
+
+
+class TestEscapeHold:
+    """How long a trailing Escape may sit in tmux as a partial key."""
+
+    @pytest.mark.parametrize(
+        "configured, expected",
+        [(10, 0.55), (0, 0.55), (500, 0.55), (2000, 2.05), (None, 0.55)],
+        ids=["3.6-default", "zero", "3.4-default", "long", "unreadable"],
+    )
+    def test_floors_at_500_ms_plus_a_margin(self, client, configured, expected):
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+        client.escape_time_ms.return_value = configured
+
+        assert backend.web_input_escape_hold() == pytest.approx(expected)

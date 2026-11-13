@@ -1,0 +1,495 @@
+"""Unit tests for terminal service get_working_directory and send_special_key functions."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cli_agent_orchestrator.services.terminal_service import (
+    exit_terminal_cli,
+    get_working_directory,
+    list_siblings,
+    send_special_key,
+)
+
+
+def test_grok_uses_runtime_skills_with_native_tool_enforcement():
+    from cli_agent_orchestrator.services.terminal_service import (
+        RUNTIME_SKILL_PROMPT_PROVIDERS,
+        SOFT_ENFORCEMENT_PROVIDERS,
+    )
+
+    assert "grok_cli" in RUNTIME_SKILL_PROMPT_PROVIDERS
+    assert "grok_cli" not in SOFT_ENFORCEMENT_PROVIDERS
+
+
+def test_none_enforcement_providers_are_in_the_soft_set():
+    """hermes and cursor_cli apply no restriction, so the create-terminal warning
+    must fire for a restricted profile on them, and must not for a provider that
+    enforces natively. kiro_cli (the default provider) left this set when
+    `cao install` started writing the policy into the agent JSON's `tools`; a
+    profile installed before that is caught by the stale-install warning instead
+    (see kiro_install_predates_native_enforcement)."""
+    from cli_agent_orchestrator.services.terminal_service import SOFT_ENFORCEMENT_PROVIDERS
+
+    assert {"hermes", "cursor_cli"} <= SOFT_ENFORCEMENT_PROVIDERS
+    assert {"claude_code", "copilot_cli", "opencode_cli", "grok_cli", "kiro_cli"}.isdisjoint(
+        SOFT_ENFORCEMENT_PROVIDERS
+    )
+
+
+def test_minimax_code_uses_runtime_skills_with_soft_tool_enforcement():
+    from cli_agent_orchestrator.services.terminal_service import (
+        RUNTIME_SKILL_PROMPT_PROVIDERS,
+        SOFT_ENFORCEMENT_PROVIDERS,
+    )
+
+    assert "mcode" in RUNTIME_SKILL_PROMPT_PROVIDERS
+    assert "mcode" in SOFT_ENFORCEMENT_PROVIDERS
+
+
+_TS = "cli_agent_orchestrator.services.terminal_service"
+
+
+class TestTerminalServiceWorkingDirectory:
+    """Test terminal service working directory functionality."""
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_working_directory_success(self, mock_get_metadata, mock_tmux_client):
+        """Test successful working directory retrieval."""
+        # Arrange
+        terminal_id = "test-terminal-123"
+        expected_dir = "/home/user/project"
+        mock_get_metadata.return_value = {
+            "tmux_session": "test-session",
+            "tmux_window": "test-window",
+        }
+        mock_tmux_client.get_pane_working_directory.return_value = expected_dir
+
+        # Act
+        result = get_working_directory(terminal_id)
+
+        # Assert
+        assert result == expected_dir
+        mock_get_metadata.assert_called_once_with(terminal_id)
+        mock_tmux_client.get_pane_working_directory.assert_called_once_with(
+            "test-session", "test-window"
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_working_directory_terminal_not_found(self, mock_get_metadata, mock_tmux_client):
+        """Test ValueError when terminal not found."""
+        # Arrange
+        terminal_id = "nonexistent-terminal"
+        mock_get_metadata.return_value = None
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Terminal 'nonexistent-terminal' not found"):
+            get_working_directory(terminal_id)
+
+        mock_get_metadata.assert_called_once_with(terminal_id)
+        mock_tmux_client.get_pane_working_directory.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_working_directory_returns_none(self, mock_get_metadata, mock_tmux_client):
+        """Test when pane has no working directory."""
+        # Arrange
+        terminal_id = "test-terminal-456"
+        mock_get_metadata.return_value = {
+            "tmux_session": "test-session",
+            "tmux_window": "test-window",
+        }
+        mock_tmux_client.get_pane_working_directory.return_value = None
+
+        # Act
+        result = get_working_directory(terminal_id)
+
+        # Assert
+        assert result is None
+        mock_get_metadata.assert_called_once_with(terminal_id)
+        mock_tmux_client.get_pane_working_directory.assert_called_once_with(
+            "test-session", "test-window"
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_working_directory_returns_directory_from_tmux_pane(
+        self, mock_get_metadata, mock_tmux_client
+    ):
+        """Test that get_working_directory returns the directory obtained from tmux pane."""
+        # Arrange
+        terminal_id = "test-terminal-789"
+        pane_dir = "/workspace/my-project/src"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-workspace",
+            "tmux_window": "developer-xyz",
+        }
+        mock_tmux_client.get_pane_working_directory.return_value = pane_dir
+
+        # Act
+        result = get_working_directory(terminal_id)
+
+        # Assert
+        assert result == pane_dir
+        mock_tmux_client.get_pane_working_directory.assert_called_once_with(
+            "cao-workspace", "developer-xyz"
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_working_directory_raises_for_nonexistent_terminal(
+        self, mock_get_metadata, mock_tmux_client
+    ):
+        """Test that get_working_directory raises ValueError for a terminal that does not exist."""
+        # Arrange
+        mock_get_metadata.return_value = None
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Terminal 'does-not-exist' not found"):
+            get_working_directory("does-not-exist")
+
+        mock_tmux_client.get_pane_working_directory.assert_not_called()
+
+
+class TestSendSpecialKey:
+    """Tests for send_special_key function."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_sends_key_via_tmux_client(
+        self, mock_get_metadata, mock_tmux_client, mock_update_last_active
+    ):
+        """Test that send_special_key sends the key via tmux client."""
+        # Arrange
+        terminal_id = "test-terminal-001"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+
+        # Act
+        result = send_special_key(terminal_id, "C-d")
+
+        # Assert
+        assert result is True
+        mock_tmux_client.send_special_key.assert_called_once_with(
+            "cao-session", "developer-abcd", "C-d"
+        )
+        mock_update_last_active.assert_called_once_with(terminal_id)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_ctrl_c(
+        self, mock_get_metadata, mock_tmux_client, mock_update_last_active
+    ):
+        """Test that send_special_key can send C-c (Ctrl+C) to a terminal."""
+        # Arrange
+        terminal_id = "test-terminal-002"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-efgh",
+        }
+
+        # Act
+        result = send_special_key(terminal_id, "C-c")
+
+        # Assert
+        assert result is True
+        mock_tmux_client.send_special_key.assert_called_once_with(
+            "cao-session", "reviewer-efgh", "C-c"
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_terminal_not_found(self, mock_get_metadata, mock_tmux_client):
+        """Test that send_special_key raises ValueError when terminal not found."""
+        # Arrange
+        mock_get_metadata.return_value = None
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Terminal 'nonexistent' not found"):
+            send_special_key("nonexistent", "C-d")
+
+        mock_tmux_client.send_special_key.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_propagates_tmux_errors(self, mock_get_metadata, mock_tmux_client):
+        """Test that send_special_key propagates exceptions from tmux client."""
+        # Arrange
+        terminal_id = "test-terminal-003"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-ijkl",
+        }
+        mock_tmux_client.send_special_key.side_effect = Exception("Tmux send error")
+
+        # Act & Assert
+        with pytest.raises(Exception, match="Tmux send error"):
+            send_special_key(terminal_id, "Escape")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_escape(
+        self, mock_get_metadata, mock_tmux_client, mock_update_last_active
+    ):
+        """Test that send_special_key can send Escape key."""
+        # Arrange
+        terminal_id = "test-terminal-004"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-mnop",
+        }
+
+        # Act
+        result = send_special_key(terminal_id, "Escape")
+
+        # Assert
+        assert result is True
+        mock_tmux_client.send_special_key.assert_called_once_with(
+            "cao-session", "developer-mnop", "Escape"
+        )
+
+
+class TestExitTerminalCli:
+    """Tests for exit_terminal_cli — the graceful CLI shutdown helper shared by
+    the exit endpoint and run_agent_step teardown (issue #312 review fix #4)."""
+
+    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}.send_special_key")
+    @patch(f"{_TS}.provider_manager")
+    def test_text_command_uses_send_input(self, mock_pm, mock_special, mock_input):
+        """A text exit command (e.g. /exit) is sent via send_input."""
+        provider = MagicMock()
+        provider.exit_cli.return_value = "/exit"
+        mock_pm.get_provider.return_value = provider
+
+        exit_terminal_cli("abcd1234")
+
+        mock_input.assert_called_once_with("abcd1234", "/exit")
+        mock_special.assert_not_called()
+
+    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}.send_special_key")
+    @patch(f"{_TS}.provider_manager")
+    def test_ctrl_key_uses_send_special_key(self, mock_pm, mock_special, mock_input):
+        """A tmux key sequence (e.g. C-d) is sent via send_special_key."""
+        provider = MagicMock()
+        provider.exit_cli.return_value = "C-d"
+        mock_pm.get_provider.return_value = provider
+
+        exit_terminal_cli("abcd1234")
+
+        mock_special.assert_called_once_with("abcd1234", "C-d")
+        mock_input.assert_not_called()
+
+    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}.send_special_key")
+    @patch(f"{_TS}.provider_manager")
+    def test_meta_key_uses_send_special_key(self, mock_pm, mock_special, mock_input):
+        """A meta key sequence (M-x) also routes via send_special_key."""
+        provider = MagicMock()
+        provider.exit_cli.return_value = "M-x"
+        mock_pm.get_provider.return_value = provider
+
+        exit_terminal_cli("abcd1234")
+
+        mock_special.assert_called_once_with("abcd1234", "M-x")
+        mock_input.assert_not_called()
+
+    @patch(f"{_TS}.provider_manager")
+    def test_no_provider_raises_value_error(self, mock_pm):
+        """No registered provider -> ValueError (mapped to 404 at the boundary)."""
+        mock_pm.get_provider.return_value = None
+        with pytest.raises(ValueError, match="Provider not found"):
+            exit_terminal_cli("deadbeef")
+
+
+class TestListSiblingsDepthClamping:
+    """#432: list_siblings() must clamp depth to [1, len(caller_group)] and
+    never let a caller widen its own discovery scope.
+
+    ``get_terminal_metadata``/``list_siblings_by_group_prefix`` are mocked so
+    these tests isolate the clamping arithmetic itself (the actual prefix
+    match is covered by the real-DB tests in
+    test/clients/test_database.py::TestListSiblingsByGroupPrefix).
+    """
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_caller_with_no_group_returns_empty_without_querying(
+        self, mock_get_metadata, mock_list_prefix
+    ):
+        """A caller with no group participates in no discovery (#432) --
+        must short-circuit before ever calling the prefix-match query."""
+        mock_get_metadata.return_value = {"group": None, "tmux_session": "cao-sess"}
+
+        result = list_siblings("caller-1", depth=2)
+
+        assert result == []
+        mock_list_prefix.assert_not_called()
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_none_defaults_to_full_own_group_length(
+        self, mock_get_metadata, mock_list_prefix
+    ):
+        """Omitting depth means the widest scope the caller is allowed: its
+        own full group."""
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5", "folder_9"],
+            "tmux_session": "cao-sess",
+        }
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=None)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1",
+            ["tenant_1", "project_5", "folder_9"],
+            caller_session="cao-sess",
+            cross_session=False,
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_wider_than_own_group_is_clamped_down(self, mock_get_metadata, mock_list_prefix):
+        """depth can never exceed len(caller_group) -- a caller cannot widen
+        its own scope by asking for more than it has (#432)."""
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5"],
+            "tmux_session": "cao-sess",
+        }
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=99)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1", "project_5"], caller_session="cao-sess", cross_session=False
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_within_range_uses_exact_prefix(self, mock_get_metadata, mock_list_prefix):
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5", "folder_9"],
+            "tmux_session": "cao-sess",
+        }
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=2)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1", "project_5"], caller_session="cao-sess", cross_session=False
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_zero_is_clamped_up_to_one_defense_in_depth(
+        self, mock_get_metadata, mock_list_prefix
+    ):
+        """The API layer rejects depth=0 outright (422, see test_terminals.py).
+        This asserts the service layer ALSO never treats an explicit 0 as an
+        unscoped, all-terminals query if it's ever reached directly --
+        defense in depth, not a documented public entry point for 0."""
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5"],
+            "tmux_session": "cao-sess",
+        }
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=0)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=False
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_negative_depth_is_clamped_up_to_one(self, mock_get_metadata, mock_list_prefix):
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5"],
+            "tmux_session": "cao-sess",
+        }
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=-5)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=False
+        )
+
+    @patch(f"{_TS}.status_monitor")
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_returns_prefix_match_results_unchanged(
+        self, mock_get_metadata, mock_list_prefix, mock_status_monitor
+    ):
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
+        mock_list_prefix.return_value = [{"id": "sib-1", "group": ["tenant_1"], "metadata": None}]
+        mock_status_monitor.get_status.return_value = MagicMock(value="idle")
+
+        result = list_siblings("caller-1", depth=1)
+
+        assert result == [
+            {"id": "sib-1", "group": ["tenant_1"], "metadata": None, "status": "idle"}
+        ]
+        assert set(result[0]) == {"id", "group", "metadata", "status"}
+        assert "model" not in result[0]
+        assert "model_honored" not in result[0]
+
+    @patch(f"{_TS}.status_monitor")
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_status_is_a_live_snapshot_per_sibling(
+        self, mock_get_metadata, mock_list_prefix, mock_status_monitor
+    ):
+        """tedswinyar, PR #433 review: siblings include a live status snapshot
+        (point-in-time, not a delivery guarantee -- see the docstring) so a
+        discovering agent can skip an obviously-finished sibling. Each
+        sibling's status is looked up individually, not assumed uniform."""
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
+        mock_list_prefix.return_value = [
+            {"id": "sib-1", "group": ["tenant_1"], "metadata": None},
+            {"id": "sib-2", "group": ["tenant_1"], "metadata": None},
+        ]
+        statuses = {"sib-1": MagicMock(value="completed"), "sib-2": MagicMock(value="idle")}
+        mock_status_monitor.get_status.side_effect = lambda terminal_id: statuses[terminal_id]
+
+        result = list_siblings("caller-1", depth=1)
+
+        assert [s["status"] for s in result] == ["completed", "idle"]
+        mock_status_monitor.get_status.assert_any_call("sib-1")
+        mock_status_monitor.get_status.assert_any_call("sib-2")
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_cross_session_true_is_forwarded(self, mock_get_metadata, mock_list_prefix):
+        """cross_session=True is an explicit opt-in the caller must pass
+        through -- default is session-scoped (issue #432 design
+        discussion)."""
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=1, cross_session=True)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=True
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_cross_session_defaults_to_false(self, mock_get_metadata, mock_list_prefix):
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=1)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=False
+        )

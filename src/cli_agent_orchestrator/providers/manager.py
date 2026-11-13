@@ -1,0 +1,469 @@
+"""Provider manager as module singleton with direct terminal_id → provider mapping."""
+
+import logging
+import os
+from typing import Dict, List, Optional, Type
+
+from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers import kiro_launch_home
+from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
+from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
+from cli_agent_orchestrator.providers.hermes import HermesProvider
+from cli_agent_orchestrator.providers.kimi_cli import (
+    KimiCliProvider,
+    KimiDialect,
+    UnsupportedKimiError,
+)
+from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunch
+from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.omp import OmpProvider
+from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+
+logger = logging.getLogger(__name__)
+
+
+class ProviderManager:
+    """Simplified provider manager with direct mapping."""
+
+    def __init__(self) -> None:
+        self._providers: Dict[str, BaseProvider] = {}
+
+    @classmethod
+    def provider_class(cls, provider: str) -> Type[BaseProvider]:
+        """Return the concrete provider class registered for ``provider``."""
+        provider_classes: Dict[str, Type[BaseProvider]] = {
+            ProviderType.KIRO_CLI.value: KiroCliProvider,
+            ProviderType.CLAUDE_CODE.value: ClaudeCodeProvider,
+            ProviderType.CODEX.value: CodexProvider,
+            ProviderType.COPILOT_CLI.value: CopilotCliProvider,
+            ProviderType.KIMI_CLI.value: KimiCliProvider,
+            ProviderType.OPENCODE_CLI.value: OpenCodeCliProvider,
+            ProviderType.OMP.value: OmpProvider,
+            ProviderType.HERMES.value: HermesProvider,
+            ProviderType.CURSOR_CLI.value: CursorCliProvider,
+            ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
+            ProviderType.GROK_CLI.value: GrokCliProvider,
+            ProviderType.MINIMAX_CODE.value: MiniMaxCodeProvider,
+            ProviderType.MOCK_CLI.value: MockCliProvider,
+        }
+        try:
+            return provider_classes[provider]
+        except KeyError as exc:
+            raise ValueError(f"Unknown provider type: {provider}") from exc
+
+    def create_provider(
+        self,
+        provider_type: str,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str] = None,
+        allowed_tools: Optional[List[str]] = None,
+        skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        engine: Optional[KiroEngine] = None,
+        resume_session_id: Optional[str] = None,
+        provider_variant: Optional[str] = None,
+        session_id: Optional[str] = None,
+        kiro_launch: Optional[KiroLaunch] = None,
+        ephemeral: bool = False,
+    ) -> BaseProvider:
+        """Create and store provider instance.
+
+        ``session_id`` (issue #1082): a CAO-generated id for a FRESH claude_code
+        launch, distinct from ``resume_session_id`` (which resumes a PRIOR one).
+        Supported only by claude_code, same restriction as ``resume_session_id``.
+
+        ``kiro_launch`` is an ephemeral Kiro helper's per-launch home and
+        kiro-cli (#1167 Phase 2); only ``kiro_cli`` accepts it.
+
+        ``ephemeral`` marks an ephemeral Claude Code helper's launch: the caller
+        sets it from the launch's ephemeral binding, the fact that marks the
+        terminal ephemeral, never from the profile text. Only
+        ``claude_code`` accepts it; Kiro helpers are told apart by ``kiro_launch``
+        and Codex helpers launch as before.
+        """
+        try:
+            provider: BaseProvider
+            if resume_session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "resume_session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
+            if session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
+            if kiro_launch is not None and provider_type != ProviderType.KIRO_CLI.value:
+                raise ValueError("a per-launch Kiro home is only for the kiro_cli provider")
+            if ephemeral and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError("the ephemeral helper cut is only for the claude_code provider")
+            if provider_type == ProviderType.KIRO_CLI.value:
+                if not agent_profile:
+                    raise ValueError("Kiro CLI provider requires agent_profile parameter")
+                resolved_engine = resolve_kiro_engine(persisted=engine)
+                provider = KiroCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    engine=resolved_engine,
+                    model=model,
+                    launch=kiro_launch,
+                )
+            elif provider_type == ProviderType.CLAUDE_CODE.value:
+                provider = ClaudeCodeProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                    effort=effort,
+                    resume_session_id=resume_session_id,
+                    session_id=session_id,
+                    ephemeral=ephemeral,
+                )
+            elif provider_type == ProviderType.CODEX.value:
+                provider = CodexProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                    effort=effort,
+                )
+            elif provider_type == ProviderType.COPILOT_CLI.value:
+                provider = CopilotCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                )
+            elif provider_type == ProviderType.KIMI_CLI.value:
+                provider = KimiCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+                if provider_variant is not None:
+                    provider.restore_runtime_variant(provider_variant)
+            elif provider_type == ProviderType.OPENCODE_CLI.value:
+                provider = OpenCodeCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                )
+                if provider_variant is not None:
+                    provider.restore_runtime_variant(provider_variant)
+            elif provider_type == ProviderType.OMP.value:
+                provider = OmpProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.HERMES.value:
+                provider = HermesProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.CURSOR_CLI.value:
+                provider = CursorCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                    skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.ANTIGRAVITY_CLI.value:
+                provider = AntigravityCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                    skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.GROK_CLI.value:
+                provider = GrokCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.MINIMAX_CODE.value:
+                provider = MiniMaxCodeProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            # --- Credentials-free mock provider (test/CI infrastructure) ---
+            elif provider_type == ProviderType.MOCK_CLI.value:
+                provider = MockCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    allowed_tools,
+                )
+            else:
+                raise ValueError(f"Unknown provider type: {provider_type}")
+
+            # Store in direct mapping
+            self._providers[terminal_id] = provider
+            logger.info(f"Created {provider_type} provider for terminal: {terminal_id}")
+            return provider
+
+        except Exception as e:
+            logger.error(
+                f"Failed to create provider {provider_type} for terminal {terminal_id}: {e}"
+            )
+            raise
+
+    def get_provider(self, terminal_id: str) -> Optional[BaseProvider]:
+        """Get provider instance, creating on-demand if not found.
+
+        Args:
+            terminal_id: Terminal ID to get provider for
+
+        Returns:
+            Provider instance
+
+        Raises:
+            ValueError: If terminal not found in database or provider creation fails
+        """
+        # Check if already exists
+        provider = self._providers.get(terminal_id)
+        if provider:
+            return provider
+
+        # Try to create on-demand from database metadata
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            raise ValueError(f"Terminal {terminal_id} not found in database")
+
+        persisted_engine = (
+            resolve_kiro_engine(persisted=metadata.get("engine"))
+            if metadata["provider"] == ProviderType.KIRO_CLI.value
+            else None
+        )
+
+        # Kimi's two CLI families share one public provider id but disagree on
+        # spinner/composer/transcript semantics.  A row created before variant
+        # persistence has no honest way to recover which process is already
+        # running after cao-server restarts.  Guessing "legacy" recreates the
+        # exact disclosure/truncation bug this state exists to prevent, so an
+        # upgrade-era terminal fails closed and asks the operator to recreate it.
+        if metadata["provider"] == ProviderType.KIMI_CLI.value and not metadata.get(
+            "provider_variant"
+        ):
+            raise UnsupportedKimiError(
+                "Cannot reconstruct an existing Kimi terminal after restart: "
+                "its launch dialect was not persisted. Recreate the terminal so "
+                "CAO can resolve and store the active Kimi CLI dialect."
+            )
+
+        # Create provider on-demand
+        provider = self.create_provider(
+            metadata["provider"],
+            terminal_id,
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            metadata["agent_profile"],
+            engine=persisted_engine,
+            provider_variant=metadata.get("provider_variant"),
+        )
+        if isinstance(provider, OpenCodeCliProvider) and not metadata.get("provider_variant"):
+            try:
+                provider.restore_runtime_variant(None)
+            except Exception:
+                self._providers.pop(terminal_id, None)
+                raise
+        # Restore shell_command baseline from DB so get_status() can detect kiro exit.
+        # The terminal already exists in the DB, so its CLI has long since
+        # launched — mark the provider as initialized so KiroCliProvider's
+        # post-launch checks (Check 3) trust the restored baseline. Without
+        # this, a restored terminal that has returned to the shell would be
+        # misreported as PROCESSING indefinitely.
+        if metadata.get("shell_command"):
+            provider.shell_baseline = metadata["shell_command"]
+            if hasattr(provider, "_initialized"):
+                provider._initialized = True
+        logger.info(f"Created provider on-demand for terminal {terminal_id}")
+        return provider
+
+    def cleanup_provider(self, terminal_id: str) -> bool:
+        """Cleanup a provider, retaining retryable private state on failure.
+
+        Grok's private home can only be deleted after its escaped updater has
+        been positively stopped or ruled out, and Kimi Code's home holds a copy
+        of the operator's credentials.  A ``False`` return therefore
+        deliberately keeps the map entry (and lets the service keep DB
+        metadata) so a later lifecycle retry does not lose the only route to
+        that deterministic home.
+        """
+        try:
+            provider = self._providers.get(terminal_id)
+            if provider:
+                cleanup_result = provider.cleanup()
+                if cleanup_result is False:
+                    logger.warning("Cleanup deferred for terminal: %s", terminal_id)
+                    return False
+                self._providers.pop(terminal_id, None)
+                logger.info(f"Cleaned up provider for terminal: {terminal_id}")
+                return True
+
+            # Provider instances are in-memory only.  After cao-server
+            # restarts terminal deletion still has database metadata, but no
+            # provider map entry.  Grok has a deterministic, private on-disk
+            # home containing generated MCP config, so instantiate the small
+            # cleanup-only adapter rather than leaking that directory.
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None or metadata.get("provider") == ProviderType.KIRO_CLI.value:
+                # An ephemeral Kiro helper's per-launch home (#1167 Phase 2). A
+                # failed create rolls back through here before (or without) its
+                # provider and row, and a restart loses the provider; the home
+                # still has its deterministic path. Installed Kiro rows have none.
+                if not self._cleanup_kiro_home(terminal_id, metadata):
+                    logger.warning("Cleanup deferred for Kiro home of terminal: %s", terminal_id)
+                    return False
+            if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
+                restored_grok_provider = GrokCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                if restored_grok_provider.cleanup() is False:
+                    logger.warning("Cleanup deferred for restored Grok provider: %s", terminal_id)
+                    return False
+                logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)
+            elif metadata and metadata.get("provider") == ProviderType.MINIMAX_CODE.value:
+                restored_minimax_provider = MiniMaxCodeProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                restored_minimax_provider.cleanup()
+                logger.info(
+                    "Cleaned up restored MiniMax Code provider for terminal: %s", terminal_id
+                )
+            elif metadata and metadata.get("provider") == ProviderType.KIMI_CLI.value:
+                # Kimi Code copies the operator's credentials, MCP configuration
+                # and Kimi state into a deterministic managed home, so a restart
+                # that loses the provider instance would otherwise leak them.
+                #
+                # The removal is deliberately *variant-independent* while the
+                # reconstruction above stays fail-closed on a NULL/unknown
+                # variant. Two concrete lifecycle reasons prove a managed home
+                # can exist for a terminal whose persisted variant is not
+                # ``code``:
+                #
+                # * ``initialize()`` materialises the home, and therefore copies
+                #   the credentials, before it returns; the service persists
+                #   ``provider_variant`` only afterwards, so a crash inside that
+                #   window leaves a credential-bearing home on a NULL-variant row
+                #   (reproduced: cleanup reported success while the copied
+                #   ``auth.json`` remained on disk);
+                # * a terminal re-launched under the other dialect keeps the home
+                #   its earlier CODE launch created.
+                #
+                # Nothing about the *dialect* is inferred here — no provider is
+                # reconstructed for a NULL/unknown row — and the deletion target
+                # is this terminal's own deterministic path inside CAO's managed
+                # root, validated before any recursive delete. ``cleanup()`` is a
+                # no-op returning True when there is no such home, which is the
+                # ordinary legacy case.
+                restored_kimi_provider = KimiCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                variant = metadata.get("provider_variant")
+                if variant == KimiDialect.CODE.value:
+                    restored_kimi_provider.restore_runtime_variant(variant)
+                if restored_kimi_provider.cleanup() is False:
+                    logger.warning(
+                        "Cleanup deferred for restored Kimi Code provider: %s", terminal_id
+                    )
+                    return False
+                logger.info("Cleaned up restored Kimi provider for terminal: %s", terminal_id)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
+            return False
+
+    @staticmethod
+    def _cleanup_kiro_home(terminal_id: str, metadata: Optional[dict]) -> bool:
+        """Remove a per-launch Kiro home with no live provider; False to retry later.
+
+        A home is removed only with proof that CAO prepared it: the prepared
+        home this process holds, the archive's record, or an ephemeral Kiro
+        terminal row (written only after the home was prepared). An entry at
+        the path without proof is left alone.
+        """
+        from cli_agent_orchestrator.clients.database import is_ephemeral_terminal
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        if not kiro_launch_home.valid_terminal_id(terminal_id):
+            return True
+        if not os.path.lexists(kiro_launch_home.kiro_home_path(terminal_id)):
+            kiro_launch_home.discard_launch_home(terminal_id)
+            return True
+        row_proof = metadata is not None and is_ephemeral_terminal(terminal_id)
+        return ephemeral_service.remove_kiro_home(terminal_id, row_proof=row_proof)
+
+    def list_providers(self) -> Dict[str, str]:
+        """List all active providers (for debugging)."""
+        return {
+            terminal_id: provider.__class__.__name__
+            for terminal_id, provider in self._providers.items()
+        }
+
+
+# Module-level singleton
+provider_manager = ProviderManager()

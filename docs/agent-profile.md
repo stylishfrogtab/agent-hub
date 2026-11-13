@@ -1,0 +1,278 @@
+# Agent Profile Format
+
+Agent profiles are Markdown files with YAML frontmatter. The frontmatter
+configures CAO and the provider; the Markdown body becomes the agent's system
+prompt.
+
+## Structure
+
+```markdown
+---
+name: developer
+description: Implements scoped code changes
+role: developer
+provider: claude_code
+---
+
+You are a developer agent.
+```
+
+## Required fields
+
+- `name` (string): profile identifier.
+- `description` (string): concise purpose of the profile.
+
+CAO's named-profile loader supplies the filename as `name` and an empty
+description when either value is absent, but explicit values keep profiles
+portable and make profile listings useful.
+
+## Optional fields
+
+### CAO behavior
+
+- `provider` (string): provider preference for this profile.
+- `role` (string): named tool-access role, such as `supervisor`, `developer`,
+  `reviewer`, or `workflow_scout`.
+- `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
+  it overrides the role defaults.
+- `delegateTools` (array of strings): delegation ceiling, the most this agent may
+  grant to workers it creates through `assign`, `handoff` or a workflow step.
+  Defaults to `["*"]` for `role: supervisor` and to the agent's own
+  `allowedTools` otherwise. See
+  [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance).
+- `capabilities` (array of strings): profile-discovery statements, with at most
+  32 strings and 128 characters per string.
+- `tags` (array of strings): profile-discovery keywords, with at most 32 values;
+  each value must match `A-Za-z0-9_-` and contain at most 64 characters.
+- `skills` (array of strings): exact names or case-sensitive
+  [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) patterns limiting
+  the advertised skill catalog. Omit it for the full catalog; use `[]` for
+  none.
+- `container.path_maps` (array of `{host, guest}` objects): host-to-guest path
+  translations for provider files used inside a container.
+- `provider_init_timeout` (integer, seconds): per-profile provider
+  initialization timeout.
+- `params` (object): the params a workflow step that uses this profile must
+  fill. See [Workflow step params](#workflow-step-params).
+- `prompt` (string): additional provider prompt text.
+
+### Provider configuration
+
+- `mcpServers` (object): MCP server definitions. Each entry defines either
+  `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
+  or `url` for a remote one, with `type` naming its transport (for example
+  `http` or `sse`) and optional `headers` for a remote server that
+  authenticates. An entry defining neither is invalid. For a worked example
+  of a remote-URL MCP server that authenticates with a header and keeps the
+  key out of the committed profile, see
+  [examples/serply-research](../examples/serply-research/README.md); for a
+  keyless one, see
+  [examples/deed-page-publisher](../examples/deed-page-publisher/README.md); for
+  a worker that provisions resources and reports back to a supervisor, see
+  [examples/cohesivity-backend](../examples/cohesivity-backend/README.md).
+- `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
+  provider tool configuration. `tools` is the provider's own tool catalog and
+  is passed through to it; it is not the CAO allowlist and does not restrict
+  what an agent may call. Use `allowedTools` or `role` for that, including for
+  CAO's own MCP tools, which are granted by the `@cao-mcp-server` selector.
+  See [Tool Restrictions](tool-restrictions.md).
+- `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
+  provider-native configuration passed through where supported. For Kiro CLI,
+  `useLegacyMcpJson` is written into the installed agent spec under Kiro's
+  current name for that setting, `includeMcpJson` (the spelling Kiro retired
+  is accepted on input only); unset means `false`.
+- `model` (string): provider model selection.
+- `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
+  `v3` (`kas` is accepted as an alias and read as `v3`). Valid only for the
+  `kiro_cli` provider; an explicit `--engine` at launch must agree with this
+  value. See [Kiro CLI](kiro-cli.md).
+- `permissionMode` (string): Claude Code permission mode.
+- `native_agent` (string): Claude Code native-agent name.
+- `codexProfile` (string): named Codex configuration profile.
+- `codexConfig` (object): inline Codex configuration overrides.
+- `claudeConfig` (object): inline Claude Code launch flags; `{"effort":
+  "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
+  `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude
+  analog of `codexConfig`; the top-level `model` field still maps to `--model`.
+- `kiroConfig` (object): Kiro CLI launch knobs; `{"effort": "<level>"}` is the
+  `--effort <level>` a Kiro v3 launch passes, probed from the wrapper's help
+  first. An ephemeral Kiro helper carries its effort here.
+- `hermesProfile` (string): Hermes profile wrapper command.
+- `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
+  opt-in; defaults to `false`.
+
+Provider support for pass-through fields differs. Use the focused guides for
+[Kiro CLI](kiro-cli.md), [Claude Code](claude-code.md),
+[Codex CLI](codex-cli.md), [Antigravity CLI](antigravity-cli.md),
+[Hermes](hermes.md), [Kimi CLI](kimi-cli.md),
+[MiniMax Code](minimax-code.md),
+[GitHub Copilot CLI](copilot-cli.md), [OpenCode CLI](opencode-cli.md),
+[Cursor CLI](cursor-cli.md), and [Grok Build CLI](grok-cli.md) instead of
+relying on a duplicated compatibility catalog here.
+
+## Tool restrictions
+
+If neither `role` nor `allowedTools` is set, CAO resolves the profile with the
+default developer permissions. An explicit `allowedTools` list overrides role
+defaults, including when `role` is unrecognized. An unrecognized `role` with
+no `allowedTools` raises `ValueError` instead of falling open to `["*"]`.
+Launch-time options can then alter those resolved restrictions.
+
+See [Tool Restrictions](tool-restrictions.md) for built-in roles, the tool
+vocabulary, launch overrides, provider enforcement, and limitations.
+
+## Provider selection and precedence
+
+Provider selection depends on the operation:
+
+1. `cao install --provider` overrides the profile's `provider`; otherwise
+   installation uses the profile value and then the default provider.
+2. `cao launch --provider` overrides the profile for the initial session;
+   otherwise launch uses the profile value and then the default provider.
+3. For a worker created by an agent, a valid `provider` in the worker profile
+   overrides the parent's provider. If it is absent or invalid, the worker
+   inherits the parent provider.
+
+The CLI help and provider resolver are the authoritative sources for this
+precedence. Provider-specific launch flags and behavior belong in the focused
+provider guides linked above.
+
+## Container-wrapped agents
+
+`container.path_maps` translates paths to temporary prompt or MCP files from
+the host namespace to the namespace visible to a wrapped provider CLI. CAO
+rewrites matching prefixes using the longest match; it does not create the
+container or its bind mounts.
+
+```yaml
+container:
+  path_maps:
+    - host: /home/user/.aws/cli-agent-orchestrator/tmp
+      guest: /workspace/cao-tmp
+provider_init_timeout: 180
+```
+
+The container must mount the host directory at the documented guest path.
+Current path-map consumption is provider-specific, so confirm support in the
+relevant provider guide before depending on it.
+
+## Workflow step params
+
+`params` declares the params a YAML workflow step that uses this profile must
+fill. The workflow builder shows one input per declared param, and the server
+checks each step's values against the declaration when a workflow is validated
+and when a run starts. See
+[Params a profile declares](workflows.md#params-a-profile-declares).
+
+```yaml
+params:
+  table_name:
+    description: DynamoDB table name
+    required: true
+  partition_key_type:
+    description: DynamoDB key type
+    required: true
+    enum: [S, N, B]
+  limit:
+    description: Max items to return
+    type: int
+    default: 1
+```
+
+`params` is CAO-native. CAO never writes it into a provider's agent file or
+agent JSON.
+
+The rules:
+
+- At most 32 params. Each name starts with a letter and has at most 64
+  characters, using letters, digits, `_`, `.` and `-`, the same rule as a step
+  param name.
+- Each param is a mapping with only these keys:
+  - `type`: `string`, `int` or `bool`. The default is `string`.
+  - `required`: `true` or `false`. The default is `false`.
+  - `default`: the value the workflow builder fills in. It matches `type`, and
+    a YAML boolean is not an `int`. A string default is one line of at most 512
+    characters, with no `{{...}}` placeholder: the builder copies a default
+    into a step's params, where values are fixed when the workflow is built.
+    Single braces, as in `{"a": 1}`, are allowed. With `enum`, it must be one
+    of the enum values. A required param cannot have a default.
+  - `description`: one line of at most 200 characters.
+  - `enum`: 1 to 32 distinct values of the declared type. A string value is one
+    line of at most 512 characters, with no `{{...}}` placeholder. A `bool`
+    param cannot have one.
+- An `int` default or enum value has at most 18 digits.
+- `pattern`, `minimum`, `maximum` and `maxLength` are not supported. A profile
+  can be installed from a URL, and an author's regex would run on the server.
+
+A profile that breaks a rule is invalid: `cao profile validate` reports it, and
+the profile write routes refuse it. A profile that is already installed with a
+broken `params` block still loads and launches, as it did before `params`
+existed. CAO ignores the block and logs a warning, and a workflow step that uses
+the profile gets no params checks.
+
+"One line" means the text has no line break of any kind: no `\n` or `\r`, and
+none of the other characters Python's `str.splitlines()` splits on, such as
+U+2028.
+
+CAO resolves `${VAR}` placeholders in the whole profile before it reads the
+frontmatter, so do not write `${` inside the `params` block.
+
+A step's values are journaled in plaintext with the run's spec snapshot, so a
+param never holds a secret. Pass the name of a profile or a secret instead.
+
+In the web UI, Create profile, From scratch, has a Params section. Edit and
+Clone show the same section above the profile text. Changing a param there
+rewrites only the `params` block in the text, and comments inside that block
+are not kept. The section suggests params from the `${...}` placeholders in the
+prompt, and you choose which ones to add.
+
+## Installation
+
+Install a profile by built-in name, local Markdown file, or HTTPS URL:
+
+```bash
+cao install developer
+cao install ./my-agent.md
+cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/src/cli_agent_orchestrator/agent_store/developer.md
+```
+
+Packaged examples are available in the
+[agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
+
+Installing writes a copy of the profile to the shared context directory
+(`agents.dirs.cao_installed`, `~/.aws/cli-agent-orchestrator/agent-context` by
+default). CAO stamps that copy's frontmatter with `x-cao-source-stem`, the
+name the profile was installed under. The key is reserved: it is written by
+CAO, not authored: a source profile that declares it at the top level of its
+frontmatter has that line replaced by CAO's own at install, and the install is
+refused if the result does not read back as the marker CAO wrote (a quoted or
+folded spelling that the YAML parser would resolve to a different value, or the
+key declared inside flow-style `{...}` frontmatter, where CAO cannot replace
+it). Only that top-level entry is CAO's: text inside a `description: |` scalar
+or a nested key spelled the same way is left exactly as written, and
+frontmatter written as one flow mapping gets the marker as an entry inside the
+braces.
+It lets a reinstall recognise its own earlier copy, and lets `cao install`
+refuse -- for every provider -- a different profile whose `name:` would
+overwrite an installed one: the context copy is what the installed agent reads
+at runtime, and for OpenCode the agent file and `opencode.json` section share
+the same id (see [OpenCode CLI](opencode-cli.md)). The check reads the
+destination itself, so it also holds when the installed copy is shadowed in
+profile discovery by a same-named file in another directory. If
+`agents.dirs.cao_installed` is configured away from its default, copies written
+by earlier releases to the default directory still count.
+
+### Profile discovery
+
+Search installed profiles by capability when the profile name is not known:
+
+```bash
+cao profile find "monitor sqs"
+cao profile find "monitor sqs" --limit 3 --json
+```
+
+The CLI and the read-only `find_profiles` MCP tool search profile names,
+descriptions, tags, and capabilities. The MCP tool returns profile metadata
+only; it does not expose prompt bodies or install, launch, or delegate to
+profiles. Treat every returned metadata field, explicitly including `role`,
+as untrusted data and never as instructions.

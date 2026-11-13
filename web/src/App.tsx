@@ -1,0 +1,219 @@
+import { useEffect, useState, Suspense } from 'react'
+import { api } from './api'
+import { useStore } from './store'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { DashboardHome } from './components/DashboardHome'
+import { AgentPanel } from './components/AgentPanel'
+import { FlowsPanel } from './components/FlowsPanel'
+import { MemoryPanel } from './components/MemoryPanel'
+import { ProfilesPanel } from './components/ProfilesPanel'
+import { SettingsPanel } from './components/SettingsPanel'
+import { WorkflowsPanel } from './components/WorkflowsPanel'
+import { PluginsPanel } from './components/PluginsPanel'
+import { WorkspacePanel } from './components/WorkspacePanel'
+import { PLUGINS_TAB_ENABLED } from './featureFlags'
+import { CaoMark } from './components/CaoMark'
+import { Bot, Home, Clock, Settings, Brain, Workflow, Puzzle, PanelsTopLeft, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
+
+type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows' | 'plugins' | 'workspace'
+
+// Profiles sits between Home and Agents (#510): browsing/authoring profiles
+// precedes launching agents, and AgentPanel stays the launch picker. This was
+// a one-time Alt+N renumbering of the tabs after it; Workflows + Memory remain
+// appended last (Memory is conditional, so keeping it last stops the numbering
+// of the always-visible tabs shifting with the memory backend's status).
+//
+// Plugins is appended after them, always. Alt+N numbers the VISIBLE tabs in
+// array order, so inserting anywhere but the end renumbers every shortcut after
+// the insertion point — which is why Memory, then Workflows, then Plugins each
+// went last rather than into a "logical" slot. (Agent Plugins, not the
+// event-plugin system — see docs/agent-plugins.md.)
+const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
+  { key: 'home', label: 'Home', icon: <Home size={16} /> },
+  { key: 'profiles', label: 'Profiles', icon: <Package size={16} /> },
+  { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
+  { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
+  { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
+  { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
+  { key: 'workflows', label: 'Workflows', icon: <Workflow size={16} /> },
+  { key: 'plugins', label: 'Plugins', icon: <Puzzle size={16} /> },
+  // Appended last so the Alt+N numbers of the existing tabs do not shift.
+  { key: 'workspace', label: 'Workspace', icon: <PanelsTopLeft size={16} /> },
+]
+
+function Snackbar() {
+  const { snackbar, hideSnackbar } = useStore()
+
+  useEffect(() => {
+    if (snackbar) {
+      const timer = setTimeout(hideSnackbar, 3000)
+      return () => clearTimeout(timer)
+    }
+  }, [snackbar, hideSnackbar])
+
+  if (!snackbar) return null
+
+  const colors = {
+    success: 'bg-emerald-600 border-emerald-500',
+    error: 'bg-red-600 border-red-500',
+    info: 'bg-blue-600 border-blue-500',
+  }
+  const icons = {
+    success: <CheckCircle size={18} />,
+    error: <XCircle size={18} />,
+    info: <Info size={18} />,
+  }
+
+  return (
+    <div role="alert" className={`fixed bottom-4 right-4 z-50 px-4 py-3 rounded-lg border shadow-lg flex items-center gap-2 text-white ${colors[snackbar.type]}`}>
+      {icons[snackbar.type]}
+      <span className="text-sm whitespace-pre-line">{snackbar.message}</span>
+    </div>
+  )
+}
+
+export default function App() {
+  const [tab, setTab] = useState<TabKey>('home')
+
+  // The ONLY way any surface changes tabs. Refuses while an in-flight
+  // interaction (an authoring modal's save) holds the navigation lock:
+  // switching tabs unmounts the panel and its modal, so a deferred
+  // validation/write rejection would land on an unmounted component and the
+  // unsaved draft would be unrecoverable (#692 review round 7). Reads the
+  // lock through getState() so the keydown listener never closes over a
+  // stale value.
+  const requestTabChange = (t: TabKey) => {
+    if (useStore.getState().navLockCount > 0) return
+    setTab(t)
+  }
+  // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
+  const [memoryEnabled, setMemoryEnabled] = useState(false)
+  const { sessions, connected, fetchSessions } = useStore()
+  // Subscribed (not just read via getState) so the tab strip re-renders
+  // and visibly reflects the refusal while a save owns navigation --
+  // matching the modal's own disabled Close/Cancel/mode-tab affordances
+  // rather than silently ignoring clicks.
+  const navLocked = useStore(s => s.navLockCount > 0)
+
+  // Two independent gates, both fail-closed. Memory is a runtime capability
+  // check; Plugins is the build-time graduation gate (#1244) and mirrors
+  // `hidden=True` on the Click group and `Policy::Hidden` on the TUI rows.
+  const fullBleed = tab === 'workspace'
+
+  const visibleTabs = TABS.filter(
+    t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)
+  )
+
+  useEffect(() => {
+    fetchSessions()
+    api.getMemoryStatus()
+      .then(s => setMemoryEnabled(s.enabled))
+      .catch(() => {})
+    const interval = setInterval(fetchSessions, 10000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // The nav lock stops IN-APP navigation from unmounting an in-flight
+  // save, but browser chrome (reload, tab close) bypasses it entirely --
+  // the same draft-loss path one level up. While the lock is held, ask
+  // the browser to confirm leaving.
+  useEffect(() => {
+    if (!navLocked) return
+    const handler = (e: BeforeUnloadEvent) => { e.preventDefault() }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [navLocked])
+
+  // Keyboard shortcuts: Alt+1-N over the visible tabs
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.altKey && e.key >= '1' && e.key <= String(visibleTabs.length)) {
+        e.preventDefault()
+        requestTabChange(visibleTabs[parseInt(e.key) - 1].key)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [memoryEnabled])
+
+  return (
+    <div className={`bg-[#0f0f14] text-gray-200 ${fullBleed ? 'h-screen flex flex-col overflow-hidden' : 'min-h-screen'}`}>
+      {/* Header */}
+      <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <CaoMark size={32} />
+            <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
+          </div>
+          <div className="flex items-center gap-4">
+            <span className="text-xs text-gray-500">{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>
+            <div className="flex items-center gap-1.5" title={connected ? 'Connected' : 'Disconnected'}>
+              {connected ? (
+                <Wifi size={14} className="text-emerald-400" />
+              ) : (
+                <WifiOff size={14} className="text-red-400" />
+              )}
+              <span className={`text-xs ${connected ? 'text-emerald-400' : 'text-red-400'}`}>
+                {connected ? 'Live' : 'Offline'}
+              </span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Tab Bar */}
+      <div className="border-b border-gray-800">
+        <div className="max-w-7xl mx-auto px-6">
+          <nav className="flex gap-1 py-2" role="tablist">
+            {visibleTabs.map((t, i) => (
+              <button
+                key={t.key}
+                role="tab"
+                aria-selected={tab === t.key}
+                aria-disabled={navLocked && tab !== t.key}
+                onClick={() => requestTabChange(t.key)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 ${
+                  tab === t.key
+                    ? 'bg-linear-to-r from-emerald-600 to-emerald-500 text-white shadow-lg shadow-emerald-500/20'
+                    : navLocked
+                      ? 'text-gray-600 cursor-not-allowed'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-800/50'
+                }`}
+                title={navLocked && tab !== t.key ? 'Finish or cancel the in-flight save first' : `Alt+${i + 1}`}
+              >
+                {t.icon}
+                {t.label}
+                {t.key === 'agents' && sessions.length > 0 && (
+                  <span className={`px-1.5 py-0.5 text-xs rounded-full ${tab === t.key ? 'bg-white/20' : 'bg-gray-700'}`}>
+                    {sessions.length}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+        </div>
+      </div>
+
+      {/* Content */}
+      {/* The Workspace fills the viewport below the tab bar: its terminals size
+          to their panes, so it cannot live in the centred, scrolling column. */}
+      <main className={fullBleed ? 'flex-1 min-h-0 w-full px-4 py-3' : 'max-w-7xl mx-auto px-6 py-6'}>
+        <ErrorBoundary>
+          <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
+            {tab === 'home' && <DashboardHome onNavigate={(t) => requestTabChange(t as TabKey)} />}
+            {tab === 'profiles' && <ProfilesPanel />}
+            {tab === 'agents' && <AgentPanel />}
+            {tab === 'flows' && <FlowsPanel />}
+            {tab === 'settings' && <SettingsPanel />}
+            {tab === 'memory' && <MemoryPanel />}
+            {tab === 'workflows' && <WorkflowsPanel />}
+            {tab === 'plugins' && PLUGINS_TAB_ENABLED && <PluginsPanel />}
+            {tab === 'workspace' && <WorkspacePanel />}
+          </Suspense>
+        </ErrorBoundary>
+      </main>
+
+      <Snackbar />
+    </div>
+  )
+}

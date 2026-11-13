@@ -1,0 +1,205 @@
+# Control Planes
+
+CAO has four inbound management surfaces and one outbound extension surface.
+The right choice depends on who initiates the action and which transport that
+caller can use — and, for one of them, on whether the sessions being managed are
+on this machine at all.
+
+## Surfaces at a glance
+
+| Surface | Direction | Caller | Transport | Best for |
+|---|---|---|---|---|
+| [Web UI](web-ui.md) | Inbound | Human operator | HTTP and WebSocket | Interactive browser management |
+| `cao session` and the [session-management skill](../skills/cao-session-management/SKILL.md) | Inbound | Human, script, CI job, or shell-capable agent | Shell to HTTP | Portable automation and one-off commands |
+| `cao-ops-mcp` | Inbound | External MCP-capable agent | MCP stdio to HTTP | Typed fleet-management tools |
+| `cao fleet` and `cao worker` | Inbound | Human or script, from outside the cluster | Shell to HTTP, through a worker broker | Managing agents that run somewhere else |
+| [Event Plugins](plugins.md) | Outbound | `cao-server` | Python hooks to an external destination | Notifications, audit records, and observability |
+
+These surfaces manage CAO from outside a session. The separate
+`cao-mcp-server` is an orthogonal, in-session surface through which CAO agents
+coordinate with tools such as `handoff`, `assign`, and `send_message`. See the
+[core MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
+and the guide to
+[choosing between assign and handoff](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff).
+
+## Inbound and outbound traffic
+
+The Web UI, shell CLI, and `cao-ops-mcp` send management requests into CAO.
+Event plugins receive events from CAO and send them outward. A bidirectional
+integration therefore needs both an inbound command path and an outbound
+event plugin.
+
+All inbound surfaces ultimately use the HTTP API. See the
+[API overview](api.md) for route families and generated OpenAPI for individual
+HTTP operations. For every surface but one that API is the `cao-server` on this
+machine; `cao fleet` and `cao worker` reach the same routes on a *remote*
+`cao-server`, one per agent, through a broker.
+
+## Web UI
+
+The browser dashboard is bundled with `cao-server` and is the simplest surface
+for interactively inspecting sessions and terminals. Its setup, remote-access,
+and frontend-development details live in the [Web UI guide](web-ui.md).
+
+## Shell CLI
+
+Use `cao session` commands for scripts, CI, cron, or any caller that can execute
+shell commands. `cao launch` creates sessions and `cao shutdown` removes them.
+`cao --skill` prints the agent-facing operating guide (preflight, launch, session
+commands, statuses, delegation, and safety), and `cao <group> --help` gives exact
+syntax. The [session-management skill](../skills/cao-session-management/SKILL.md)
+adds profile discovery and worker communication.
+
+For in-session delegation, `cao agent assign --description "Review tests"` and
+`cao agent handoff --description "Review tests"` optionally label the new worker's
+responsibility. The in-session MCP tools `assign`, `handoff`, and `assign_elastic`
+accept the same optional `description` parameter. It is set on creation,
+normalized, and truncated to 64 Unicode code points; later tasks and terminal
+reuse do not overwrite it. Operators can edit it in Home or Agents. See the
+[canonical description contract](api.md#terminal-descriptions) for normalization,
+omission versus `null`, editing, and idempotency.
+
+`cao agent assign`, `cao agent handoff` and `cao agent send-message` take the
+task text as a positional argument or, for anything longer than a shell argument
+comfortably holds, from `--message-file PATH` (`-` reads stdin). The file is read
+as UTF-8 and exactly one trailing newline is dropped, so a file written by an
+editor sends the same text as the quoted argument would. The two forms are
+mutually exclusive, and one is required:
+
+```bash
+cao agent handoff reviewer --message-file review-task.md --json
+git diff | cao agent send-message --message-file - --to "$SUPERVISOR_TERMINAL_ID"
+```
+
+## Remote fleets
+
+`cao fleet` and `cao worker` manage agents that are not on this machine. Every
+other surface here addresses the `cao-server` beside it; these two address a
+cluster, where each agent has a `cao-server` of its own inside its own pod.
+
+One distinction is worth keeping straight because two commands are one word
+apart and neither can do the other's job. `cao shutdown` removes sessions on
+this machine. `cao fleet shutdown` releases workers in a cluster, and the
+sessions inside them go with the workers.
+
+In CAO docs, "fleet" names three different things: the machines coordinated by
+`examples/fleet` (`fleet.json`, `cao-ops-mcp`), the Kubernetes worker cluster that
+`cao fleet` manages through a worker broker, and the sessions and terminals one
+`cao-server` can see (the AG-UI "fleet snapshot"). Only the second is meant in
+this section.
+
+Two variables are the whole configuration:
+
+```bash
+export CAO_ELASTIC_BROKER_URL=http://127.0.0.1:9890   # a port-forward is enough
+export CAO_ELASTIC_BROKER_TOKEN=...
+cao fleet status
+```
+
+`cao fleet status` summarises the fleet and `cao fleet shutdown` empties it.
+`cao worker list` names the workers, and the per-worker verbs — `status`, `send`,
+`sessions`, `attach`, `logs`, `release` — are `cao session`'s verbs pointed at
+one of them. Note that the broker's lease record is what `list` reads, so it
+also answers the question a deleted pod cannot: why a worker is gone.
+
+The cluster side is a reference implementation rather than part of CAO: the
+commands speak four HTTP routes and know nothing about Kubernetes, so any
+scheduler that serves those routes can be driven by them. See
+[`examples/cao-clusters/kubernetes/eks/`](../examples/cao-clusters/kubernetes/eks/)
+for the broker, the manifests, and the contract itself.
+
+## `cao-ops-mcp` server
+
+`cao-ops-mcp` exposes operations such as profile installation, session launch,
+and session inspection as typed MCP tools. Use it when a primary agent outside
+CAO already speaks MCP and benefits from tool discovery and structured
+arguments. The server forwards operations to a running `cao-server`; it does
+not replace the in-session `cao-mcp-server`.
+
+Start `cao-server` before the MCP server. By default, both use
+`http://localhost:9889`; when CAO uses a custom endpoint, set `CAO_API_HOST` and
+`CAO_API_PORT` in the MCP server environment to match it.
+
+For Claude Code, add this stdio server to `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cao-ops-mcp": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+        "cao-ops-mcp-server"
+      ]
+    }
+  }
+}
+```
+
+For other MCP clients, configure the equivalent stdio command:
+
+```bash
+uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
+```
+
+The current tools are grouped by purpose:
+
+- Profiles: `list_profiles`, `get_profile_details`, `install_profile`
+- Launch and messaging: `launch_session`, `send_session_message`
+- Terminal inspection: `read_session_output`, `get_terminal_status`,
+  `get_terminal_output`
+- Session lifecycle: `list_sessions`, `get_session_info`, `shutdown_session`
+
+Installed [plugins](plugins.md#mcp-tool-surfaces) can register additional tools on this
+server through `on_mcp_server`, the same hook `cao-mcp-server` honours.
+
+`launch_session` returns the resolved `provider` alongside `session_name` and
+`terminal_id`, so a caller can confirm a worker landed on the provider it asked
+for before sending work. CAO stores session names with a `cao-` prefix
+(`launch_session(session_name="acc-1")` creates `cao-acc-1`); the name-taking
+tools accept either the stored name or the bare name you passed at launch.
+
+MCP tool discovery is authoritative for clients. The declarations in
+[`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)
+are the source of truth when the server surface changes.
+
+For a runnable walkthrough of the full lifecycle — discover, launch, poll for
+readiness, follow up, read output, shut down — see
+[`examples/ops-mcp/`](../examples/ops-mcp/). It also documents the boundary
+between this external plane and in-session orchestration, and the readiness
+polling that `launch_session` requires because it returns before the provider is
+up.
+
+Choose the surface by caller:
+
+| Caller | Preferred surface |
+|---|---|
+| Human in a browser | Web UI |
+| Shell script, CI step, or cron job | `cao session` |
+| External MCP-capable agent | `cao-ops-mcp` |
+| Agent that can execute shell but not MCP | `cao session` through the skill |
+| Operator of agents running in a cluster | `cao fleet` and `cao worker` |
+| Custom application | [HTTP API](api.md) |
+
+## Outbound event plugins
+
+Event plugins are Python extensions loaded by `cao-server`. They subscribe to
+lifecycle and message events and can forward those events to chat systems,
+logs, metrics, or other destinations. They are event consumers, not an inbound
+management protocol. They are unrelated to [Agent Plugins](agent-plugins.md),
+which are portable packages of skills and MCP servers.
+
+The [event plugins guide](plugins.md) owns installation, supported events,
+troubleshooting, and authoring. The
+[`cao-plugin` skill](../skills/cao-plugin/SKILL.md) provides guided
+scaffolding.
+
+## Related reading
+
+- [Web UI](web-ui.md)
+- [HTTP API and PTY WebSocket](api.md)
+- [Event Plugin guide](plugins.md)
+- [Session-management skill](../skills/cao-session-management/SKILL.md)
+- [In-session MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
+- [Assign and handoff selection](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff)

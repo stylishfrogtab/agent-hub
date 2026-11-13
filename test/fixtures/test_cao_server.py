@@ -1,0 +1,398 @@
+"""Self-tests for the managed cao-server fixtures.
+
+Run with: ``uv run pytest -m e2e test/fixtures/test_cao_server.py -v``.
+
+Each test owns its own lifecycle except where it depends on the session
+fixtures (``cao_server``, ``cao_server_with_auth``). The parallelism and
+idempotency tests spawn ad-hoc cao-server instances via ``_start_cao_server``
+so they don't disturb the session-scoped server.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import contextlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from test.conftest import mint_test_token
+from test.fixtures.cao_server import (
+    AuthCaoServer,
+    CaoServer,
+    _JWKSServer,
+    _kiro_cli_seed_paths,
+    _pick_free_port,
+    _seed_kiro_e2e_state,
+    _seed_omp_e2e_state,
+    _session_rsa_keys,
+    _start_cao_server,
+    _subprocess_env,
+)
+
+import pytest
+import requests
+
+pytestmark = pytest.mark.e2e
+
+
+# ---------------------------------------------------------------------------
+# cao_server (session) — basic shape
+# ---------------------------------------------------------------------------
+
+
+def test_health_reachable(cao_server: CaoServer) -> None:
+    resp = requests.get(f"{cao_server.url}/health", timeout=2.0)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["service"] == "cli-agent-orchestrator"
+
+
+def test_url_uses_dynamic_port(cao_server: CaoServer) -> None:
+    assert cao_server.port != 9889, "fixture must allocate a free port, not the default"
+    assert f":{cao_server.port}" in cao_server.url
+    assert cao_server.url.startswith("http://127.0.0.1:")
+
+
+def test_home_isolated(cao_server: CaoServer) -> None:
+    """Subprocess writes land under the redirected HOME, not the dev's real one."""
+    cao_root = cao_server.home_dir / ".aws" / "cli-agent-orchestrator"
+    assert cao_root.exists(), f"subprocess never wrote anything under {cao_root}"
+    # The logs subdir is created during lifespan setup_logging().
+    assert (cao_root / "logs").exists()
+
+
+def test_omp_e2e_state_is_non_secret_and_complete(cao_server: CaoServer) -> None:
+    home = cao_server.home_dir
+    assert (home / ".omp" / "agent" / "config.yml").read_text(
+        encoding="utf-8"
+    ) == "setupVersion: 1\n"
+    store = home / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    for name in ("data_analyst", "report_generator", "analysis_supervisor"):
+        assert (store / f"{name}.md").exists()
+
+
+def test_omp_e2e_seed_is_idempotent(tmp_path: Path) -> None:
+    _seed_omp_e2e_state(tmp_path)
+    _seed_omp_e2e_state(tmp_path)
+
+    assert (tmp_path / ".omp" / "agent" / "config.yml").read_text(
+        encoding="utf-8"
+    ) == "setupVersion: 1\n"
+
+
+def _fake_kiro_home(root: Path, *, with_data_dir: bool = True) -> Path:
+    """A stand-in for the developer's HOME with kiro's login/helper paths present."""
+    real_home = root / "real-home"
+    for rel in _kiro_cli_seed_paths():
+        if not with_data_dir and rel.parts[-1] == "kiro-cli":
+            continue
+        (real_home / rel).mkdir(parents=True)
+        (real_home / rel / "marker").write_text("x", encoding="utf-8")
+    return real_home
+
+
+def test_kiro_seed_links_every_present_path_by_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each kiro path that exists in the real HOME becomes a symlink in the
+    server HOME pointing at the original: nothing is copied."""
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path)
+    home_dir = tmp_path / "server-home"
+    home_dir.mkdir()
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    assert _kiro_cli_seed_paths(), "the seed list is empty"
+    for rel in _kiro_cli_seed_paths():
+        dest = home_dir / rel
+        assert dest.is_symlink(), f"{rel} was not linked"
+        assert dest.resolve() == (real_home / rel).resolve()
+        assert (dest / "marker").read_text(encoding="utf-8") == "x"
+
+
+def test_kiro_seed_skips_paths_missing_from_the_real_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path the developer does not have is not invented; the others still link."""
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path, with_data_dir=False)
+    home_dir = tmp_path / "server-home"
+    home_dir.mkdir()
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    data_dirs = [rel for rel in _kiro_cli_seed_paths() if rel.parts[-1] == "kiro-cli"]
+    for rel in data_dirs:
+        assert not (home_dir / rel).exists() and not (home_dir / rel).is_symlink()
+    for rel in _kiro_cli_seed_paths():
+        if rel not in data_dirs:
+            assert (home_dir / rel).is_symlink()
+
+
+def test_kiro_seed_is_a_noop_without_kiro_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: None)
+    real_home = _fake_kiro_home(tmp_path)
+    home_dir = tmp_path / "server-home"
+    home_dir.mkdir()
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    assert list(home_dir.iterdir()) == []
+
+
+def test_kiro_seed_is_idempotent_and_leaves_an_existing_destination_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path)
+    home_dir = tmp_path / "server-home"
+    own_sso = home_dir / ".aws" / "sso"
+    own_sso.mkdir(parents=True)
+    (own_sso / "mine").write_text("keep", encoding="utf-8")
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    assert not own_sso.is_symlink() and (own_sso / "mine").read_text(encoding="utf-8") == "keep"
+    assert (home_dir / ".local" / "bin").is_symlink()
+
+
+def test_kiro_seed_never_links_a_home_onto_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path)
+
+    _seed_kiro_e2e_state(real_home, real_home=real_home)
+
+    for rel in _kiro_cli_seed_paths():
+        assert not (real_home / rel).is_symlink()
+
+
+def test_log_file_populated(cao_server: CaoServer) -> None:
+    assert cao_server.log_path.exists()
+    content = cao_server.log_path.read_text(errors="replace")
+    # uvicorn or our logger prints something during startup. Don't pin on a
+    # specific banner — just confirm bytes flowed.
+    assert content.strip(), "subprocess produced no stdout/stderr output"
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc server (idempotency, parallelism, failure-diagnostics) — uses
+# _start_cao_server directly so we don't kill the session fixture.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_is_idempotent(tmp_path_factory: pytest.TempPathFactory) -> None:
+    home = tmp_path_factory.mktemp("cao_idempotent")
+    server = _start_cao_server(home, _pick_free_port())
+    try:
+        server.stop()
+        server.stop()  # second call must not raise
+    finally:
+        with contextlib.suppress(Exception):
+            server.stop()
+
+
+def test_parallel_ports_distinct(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Two concurrent _start_cao_server calls get distinct ports and both work."""
+    homes = [
+        tmp_path_factory.mktemp("cao_par_a"),
+        tmp_path_factory.mktemp("cao_par_b"),
+    ]
+
+    def _spawn(home: Path) -> CaoServer:
+        return _start_cao_server(home, _pick_free_port())
+
+    servers: list[CaoServer] = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_spawn, h) for h in homes]
+            servers = [f.result() for f in futures]
+        a, b = servers
+        assert a.port != b.port, "concurrent allocations collided on the same port"
+        for srv in servers:
+            r = requests.get(f"{srv.url}/health", timeout=2.0)
+            assert r.status_code == 200
+    finally:
+        for srv in servers:
+            with contextlib.suppress(Exception):
+                srv.stop()
+
+
+def test_second_server_on_same_home_is_refused(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A second cao-server on the same CAO_HOME_DIR exits non-zero before serving (#406, #709).
+
+    Different port on purpose: the port used to be the only guard.
+    """
+    home = tmp_path_factory.mktemp("cao_one_per_home")
+    first = _start_cao_server(home, _pick_free_port())
+    try:
+        cao_home = home / ".aws" / "cli-agent-orchestrator"
+        diagnostics = json.loads((cao_home / "server.lock").read_text())
+        assert diagnostics["port"] == first.port
+
+        second_port = _pick_free_port()
+        second = subprocess.run(
+            [sys.executable, "-m", "cli_agent_orchestrator.api.main", "--port", str(second_port)],
+            env=_subprocess_env(home, second_port),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert second.returncode != 0, second.stdout + second.stderr
+        lines = second.stderr.splitlines()
+        first_line = next(line for line in lines if line.startswith("cao: another server"))
+        assert first_line.startswith(
+            f"cao: another server (PID {diagnostics['pid']}, port {first.port}, started "
+        )
+        assert first_line.endswith("Z) already owns")
+        assert f"     {cao_home}" in lines
+        assert (
+            "     Stop it, or run this instance with a different CAO_HOME_DIR and --port." in lines
+        )
+        # The second server never bound its port and the first still serves.
+        with pytest.raises(requests.ConnectionError):
+            requests.get(f"http://127.0.0.1:{second_port}/health", timeout=1.0)
+        assert requests.get(f"{first.url}/health", timeout=2.0).status_code == 200
+        assert json.loads((cao_home / "server.lock").read_text()) == diagnostics
+    finally:
+        first.stop()
+
+
+def test_startup_failure_raises_with_log_tail(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A subprocess that crashes during startup surfaces a diagnostic, not a hang."""
+    home = tmp_path_factory.mktemp("cao_crash")
+    with pytest.raises(RuntimeError) as excinfo:
+        _start_cao_server(
+            home,
+            _pick_free_port(),
+            extra_env={"CAO_API_PORT": "not-an-int"},
+            deadline=4.0,
+        )
+    msg = str(excinfo.value)
+    assert "Log tail" in msg
+    # The subprocess died (exit code) OR the deadline expired — either is fine.
+    assert "cao-server" in msg
+
+
+# ---------------------------------------------------------------------------
+# JWKS server — direct unit
+# ---------------------------------------------------------------------------
+
+
+def test_jwks_server_returns_expected_key() -> None:
+    _, public_jwk = _session_rsa_keys()
+    server = _JWKSServer(public_jwk)
+    server.start()
+    try:
+        resp = requests.get(server.url, timeout=2.0)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "keys" in body
+        assert len(body["keys"]) == 1
+        assert body["keys"][0]["kid"] == "test-kid"
+        assert body["keys"][0]["kty"] == "RSA"
+    finally:
+        server.stop()
+
+
+def test_jwks_server_stop_is_idempotent() -> None:
+    _, public_jwk = _session_rsa_keys()
+    server = _JWKSServer(public_jwk)
+    server.start()
+    server.stop()
+    server.stop()  # second call must not raise
+
+
+def test_jwks_server_404_on_other_paths() -> None:
+    _, public_jwk = _session_rsa_keys()
+    server = _JWKSServer(public_jwk)
+    server.start()
+    try:
+        base = server.url.rsplit("/", 1)[0]
+        resp = requests.get(f"{base}/some-other-path", timeout=2.0)
+        assert resp.status_code == 404
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# cao_server_with_auth — subprocess sees real Auth0 enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_auth_rejects_no_token(cao_server_with_auth: AuthCaoServer) -> None:
+    """Subprocess with AUTH0_DOMAIN set must reject unauthenticated mutations.
+
+    Targets a write-scoped endpoint (DELETE /sessions/...) which is gated
+    on cao:admin. With no Authorization header the dependency chain stops
+    at 401 before reaching the not-found check.
+    """
+    resp = requests.delete(
+        f"{cao_server_with_auth.server.url}/sessions/nonexistent-test",
+        timeout=2.0,
+    )
+    assert (
+        resp.status_code == 401
+    ), f"expected 401 with no Authorization header, got {resp.status_code}: {resp.text}"
+
+
+def test_auth_accepts_valid_token(cao_server_with_auth: AuthCaoServer) -> None:
+    """Subprocess accepts a JWT signed with the matching JWKS keypair.
+
+    With a full-scope token the same DELETE that returned 401 above should
+    advance past the auth gate. The session itself doesn't exist, so the
+    handler returns 404 / 500 — anything but 401 proves auth passed.
+    """
+    token = mint_test_token(cao_server_with_auth.private_pem)
+    resp = requests.delete(
+        f"{cao_server_with_auth.server.url}/sessions/nonexistent-test",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=2.0,
+    )
+    assert (
+        resp.status_code != 401
+    ), f"expected non-401 with valid Bearer token, got {resp.status_code}: {resp.text}"
+
+
+# ---------------------------------------------------------------------------
+# cao_terminal — gated on a provider CLI being available
+# ---------------------------------------------------------------------------
+
+
+def test_cao_terminal_create_and_get(
+    cao_server: CaoServer,
+    cao_terminal: str,
+) -> None:
+    if not shutil.which("kiro-cli"):
+        pytest.skip("kiro-cli not available — default cao_terminal provider needs it")
+    assert isinstance(cao_terminal, str) and cao_terminal
+    # The terminal endpoint should be reachable while the fixture holds the
+    # session open. The status field is provider-dependent — we only assert
+    # that the resource exists and the API responds.
+    resp = requests.get(
+        f"{cao_server.url}/terminals/{cao_terminal}",
+        timeout=2.0,
+    )
+    assert resp.status_code == 200, f"GET /terminals/{cao_terminal} returned {resp.status_code}"

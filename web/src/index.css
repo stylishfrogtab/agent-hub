@@ -1,0 +1,72 @@
+@import 'tailwindcss';
+
+@config '../tailwind.config.js';
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /* Keep the v3 Preflight pointer cursor on buttons and gray placeholders. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+
+  /* One dropdown arrow for every single-choice select. The browser's own arrow
+     ignores padding and sits a few pixels from the right border, so draw a
+     chevron with a fixed inset instead. A select that sets its padding with
+     utilities must keep pr-8 or more, or its text runs under the chevron. */
+  select:not([multiple]):not([size]) {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-position: right 0.625rem center;
+    background-repeat: no-repeat;
+    background-size: 1rem 1rem;
+    padding-right: 2rem;
+  }
+}
+
+body {
+  background: #0f0f14;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+
+/* Tailwind CSS v4 puts utilities in a cascade layer. Keep this default in the
+   base layer so that focus and outline utilities still override it. */
+@layer base {
+  *:focus-visible {
+    outline: 2px solid #059669;
+    outline-offset: 2px;
+  }
+}
+
+/* Memory graph node drag (MemoryGraphView). Sigma v4 rewrites the container's
+   inline cursor on each hover change, so this rule must be !important and
+   must also cover Sigma's child layers. */
+.cao-graph-dragging,
+.cao-graph-dragging * {
+  cursor: grabbing !important;
+}
+

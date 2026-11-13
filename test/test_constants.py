@@ -1,0 +1,909 @@
+"""Tests for CLI Agent Orchestrator constants."""
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+
+class TestServerConstants:
+    """Tests for server configuration constants."""
+
+    def test_server_host_defaults_to_127_0_0_1(self):
+        """Test that SERVER_HOST defaults to '127.0.0.1' (not 'localhost')."""
+        # Re-import with clean environment to test default
+        with patch.dict("os.environ", {}, clear=False):
+            # Remove CAO_API_HOST if present so the default is used
+            import os
+
+            env_copy = os.environ.copy()
+            env_copy.pop("CAO_API_HOST", None)
+            with patch.dict("os.environ", env_copy, clear=True):
+                import importlib
+
+                import cli_agent_orchestrator.constants as constants_module
+
+                importlib.reload(constants_module)
+                assert constants_module.SERVER_HOST == "127.0.0.1"
+
+    def test_server_port_defaults_to_9889(self):
+        """Test that SERVER_PORT defaults to 9889."""
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_API_PORT", None)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import importlib
+
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            assert constants_module.SERVER_PORT == 9889
+
+    def test_server_host_is_not_localhost(self):
+        """Test that the default SERVER_HOST is an IP, not 'localhost'."""
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_API_HOST", None)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import importlib
+
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            assert constants_module.SERVER_HOST != "localhost"
+
+
+class TestCorsOrigins:
+    """Tests for CORS configuration constants."""
+
+    def test_cors_origins_includes_localhost_5173(self):
+        """Test that CORS_ORIGINS includes localhost:5173 for the web UI."""
+        from cli_agent_orchestrator.constants import CORS_ORIGINS
+
+        assert "http://localhost:5173" in CORS_ORIGINS
+
+    def test_cors_origins_includes_127_0_0_1_5173(self):
+        """Test that CORS_ORIGINS includes 127.0.0.1:5173 for the web UI."""
+        from cli_agent_orchestrator.constants import CORS_ORIGINS
+
+        assert "http://127.0.0.1:5173" in CORS_ORIGINS
+
+    def test_cors_origins_includes_localhost_3000(self):
+        """Test that CORS_ORIGINS includes localhost:3000."""
+        from cli_agent_orchestrator.constants import CORS_ORIGINS
+
+        assert "http://localhost:3000" in CORS_ORIGINS
+
+    def test_cors_origins_includes_127_0_0_1_3000(self):
+        """Test that CORS_ORIGINS includes 127.0.0.1:3000."""
+        from cli_agent_orchestrator.constants import CORS_ORIGINS
+
+        assert "http://127.0.0.1:3000" in CORS_ORIGINS
+
+
+class TestNetworkAllowlistEnvOverrides:
+    """Tests for env-var-driven extensions of the network allowlists (issues #149, #151).
+
+    Each override extends the built-in defaults rather than replacing them, so an
+    operator can add a Docker bridge IP or a custom origin without locking
+    themselves out of loopback access.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        # Strip any pre-set network override vars so the test starts from the
+        # documented defaults, then layer the overrides under test on top.
+        for key in (
+            "CAO_CORS_ORIGINS",
+            "CAO_ALLOWED_HOSTS",
+            "CAO_WS_ALLOWED_CLIENTS",
+            "CAO_WS_ALLOWED_ORIGINS",
+        ):
+            env_copy.pop(key, None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_cao_cors_origins_extends_defaults(self):
+        mod = self._reload_constants(
+            {"CAO_CORS_ORIGINS": "http://app.local,http://example.test:9000"}
+        )
+        # Use .count() == 1 instead of `in` so CodeQL's
+        # py/incomplete-url-substring-sanitization query does not
+        # pattern-match (the operand is a list, so `in` is exact-match,
+        # but the AST shape triggers a false positive).
+        origins = list(mod.CORS_ORIGINS)
+        assert origins.count("http://localhost:5173") == 1
+        assert origins.count("http://app.local") == 1
+        assert origins.count("http://example.test:9000") == 1
+
+    def test_cao_allowed_hosts_extends_defaults(self):
+        mod = self._reload_constants({"CAO_ALLOWED_HOSTS": "cao.internal,proxy.example.com"})
+        hosts = list(mod.ALLOWED_HOSTS)
+        assert hosts.count("localhost") == 1
+        assert hosts.count("127.0.0.1") == 1
+        assert hosts.count("cao.internal") == 1
+        assert hosts.count("proxy.example.com") == 1
+
+    def test_cao_ws_allowed_clients_extends_defaults(self):
+        mod = self._reload_constants({"CAO_WS_ALLOWED_CLIENTS": "172.17.0.1, 192.168.1.5"})
+        assert "127.0.0.1" in mod.WS_ALLOWED_CLIENTS
+        assert "::1" in mod.WS_ALLOWED_CLIENTS
+        assert "172.17.0.1" in mod.WS_ALLOWED_CLIENTS
+        # Leading whitespace stripped
+        assert "192.168.1.5" in mod.WS_ALLOWED_CLIENTS
+
+    def test_overrides_skip_empty_segments(self):
+        mod = self._reload_constants({"CAO_WS_ALLOWED_CLIENTS": ",,172.17.0.1,, ,"})
+        assert "" not in mod.WS_ALLOWED_CLIENTS
+        assert "172.17.0.1" in mod.WS_ALLOWED_CLIENTS
+
+    def test_defaults_when_env_not_set(self):
+        mod = self._reload_constants({})
+        # Defaults intact, no extras.
+        assert mod.WS_ALLOWED_CLIENTS == ["127.0.0.1", "::1", "localhost"]
+        assert mod.ALLOWED_HOSTS == ["localhost", "127.0.0.1"]
+        assert mod.CORS_ORIGINS == [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
+        ]
+
+
+class TestAddLocalCorsOrigins:
+    """Tests for runtime CORS extension from the cao-server listen address (issue #151)."""
+
+    def _reload_constants(self):
+        """Reload constants with the network override env vars stripped so the
+        list under test always starts from the documented defaults."""
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        for key in (
+            "CAO_CORS_ORIGINS",
+            "CAO_ALLOWED_HOSTS",
+            "CAO_WS_ALLOWED_CLIENTS",
+            "CAO_WS_ALLOWED_ORIGINS",
+        ):
+            env_copy.pop(key, None)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_custom_port_on_loopback_host_adds_localhost_and_ip_origins(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("127.0.0.1", 9999)
+        assert "http://localhost:9999" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:9999" in mod.CORS_ORIGINS
+
+    def test_wildcard_bind_derives_loopback_origins(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("0.0.0.0", 8080)
+        assert "http://localhost:8080" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:8080" in mod.CORS_ORIGINS
+
+    def test_custom_host_adds_that_host_only(self):
+        mod = self._reload_constants()
+        host, port = "cao.internal", 9889
+        mod.add_local_cors_origins(host, port)
+        origins = list(mod.CORS_ORIGINS)
+        assert origins.count(f"http://{host}:{port}") == 1
+        assert origins.count(f"http://localhost:{port}") == 0
+        assert origins.count(f"http://127.0.0.1:{port}") == 0
+
+    def test_idempotent_when_called_twice(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("127.0.0.1", 9999)
+        mod.add_local_cors_origins("127.0.0.1", 9999)
+        assert mod.CORS_ORIGINS.count("http://localhost:9999") == 1
+        assert mod.CORS_ORIGINS.count("http://127.0.0.1:9999") == 1
+
+    def test_default_port_does_not_duplicate_existing_origins(self):
+        mod = self._reload_constants()
+        # 5173 is already in the built-in defaults; calling with that port
+        # must not add a duplicate entry.
+        mod.add_local_cors_origins("127.0.0.1", 5173)
+        assert mod.CORS_ORIGINS.count("http://localhost:5173") == 1
+        assert mod.CORS_ORIGINS.count("http://127.0.0.1:5173") == 1
+
+    def test_mutation_is_observable_through_existing_reference(self):
+        """CORSMiddleware stores the list by reference. Mutating the module
+        attribute after middleware install must be visible to anyone holding
+        a prior reference, otherwise the runtime extension does nothing."""
+        mod = self._reload_constants()
+        captured = mod.CORS_ORIGINS  # the reference the middleware would hold
+        mod.add_local_cors_origins("127.0.0.1", 7777)
+        assert "http://localhost:7777" in captured
+        assert "http://127.0.0.1:7777" in captured
+
+    def test_ipv6_loopback_adds_all_loopback_aliases(self):
+        """``::1`` is loopback like ``127.0.0.1`` / ``localhost``: any of the
+        three should grant same-host access from a browser that picks any of
+        the others, so all three origins are added."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("::1", 9999)
+        assert "http://localhost:9999" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:9999" in mod.CORS_ORIGINS
+        assert "http://[::1]:9999" in mod.CORS_ORIGINS
+
+    def test_ipv6_wildcard_bind_includes_bracketed_loopback(self):
+        """Binding on ``::`` must also allow IPv6 loopback in brackets — that
+        is the form a browser actually emits in ``Origin``."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("::", 8080)
+        assert "http://[::1]:8080" in mod.CORS_ORIGINS
+
+    def test_ipv6_literal_host_is_bracketed(self):
+        """A non-loopback IPv6 literal must be formatted with brackets so the
+        derived origin matches the ``Origin`` header the browser sends."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("2001:db8::1", 9889)
+        assert "http://[2001:db8::1]:9889" in mod.CORS_ORIGINS
+        # The unbracketed form would never match a real Origin header and so
+        # would only bloat the allowlist — guard against accidental reintro.
+        assert "http://2001:db8::1:9889" not in mod.CORS_ORIGINS
+
+
+class TestIsWsOriginAllowed:
+    """Tests for the CWE-1385 cross-site WebSocket hijacking Origin guard.
+
+    ``is_ws_origin_allowed`` decides whether a WebSocket PTY handshake with a
+    given ``Origin`` header may open a socket. It reads the module-level
+    ``CORS_ORIGINS`` / ``WS_ALLOWED_ORIGINS`` lists, so patch those on the
+    module object rather than importing the values by value.
+    """
+
+    def test_missing_origin_is_allowed(self):
+        """Non-browser clients (CLI, websockets lib) send no Origin; the CSRF
+        threat is browser-only, so a missing Origin passes the guard."""
+        from cli_agent_orchestrator import constants
+
+        assert constants.is_ws_origin_allowed(None) is True
+        assert constants.is_ws_origin_allowed("") is True
+
+    def test_origin_in_cors_list_is_allowed(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://localhost:9889") is True
+
+    def test_foreign_origin_is_rejected(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://evil.example.com") is False
+
+    def test_extra_ws_origin_is_allowed(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", ["https://tunnel.example.dev"]):
+                assert constants.is_ws_origin_allowed("https://tunnel.example.dev") is True
+
+    def test_cors_wildcard_does_not_disable_ws_guard(self):
+        """Deliberate divergence from CORSMiddleware: a ``*`` in CORS_ORIGINS
+        (CAO_CORS_ORIGINS="*") must NOT wave through arbitrary WS origins — PTY
+        access is RCE-grade, so only the dedicated CAO_WS_ALLOWED_ORIGINS="*"
+        disables the check. The literal "*" only ever matches a "*" Origin,
+        which no browser sends."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["*"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://evil.example.com") is False
+                # A real same-origin request still works via the Host match.
+                assert (
+                    constants.is_ws_origin_allowed("http://localhost:9889", "localhost:9889")
+                    is True
+                )
+
+    def test_wildcard_disables_check(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", ["*"]):
+                assert constants.is_ws_origin_allowed("http://anything.example") is True
+
+    def test_null_origin_string_is_rejected(self):
+        """Sandboxed iframes and some cross-site contexts send the literal
+        string ``"null"``. It is a real (truthy) Origin, not an absent one, so
+        it must not pass unless explicitly allowlisted."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("null") is False
+
+    def test_same_origin_via_host_match_is_allowed_without_allowlist(self):
+        """Origin authority == request Host is same-origin (the bundled viewer)
+        and passes even when both allowlists are empty — this is what keeps the
+        imported-app / dynamic-proxy deployments working."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("http://localhost:9889", "localhost:9889")
+                    is True
+                )
+                # Proxied HTTPS at a dynamic hostname, same authority as Host.
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "https://myspace-9889.app.github.dev",
+                        "myspace-9889.app.github.dev",
+                    )
+                    is True
+                )
+
+    def test_origin_authority_mismatch_with_host_is_rejected(self):
+        """A foreign Origin is rejected even when a Host is supplied — the
+        attacker's Origin authority never equals the CAO server's Host."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("http://evil.example.com", "localhost:9889")
+                    is False
+                )
+
+    def test_null_origin_not_treated_as_same_origin(self):
+        """The opaque ``"null"`` origin has no http/https authority, so it can
+        never satisfy the Host match regardless of the request Host."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("null", "localhost:9889") is False
+
+    def test_non_http_scheme_origin_not_same_origin(self):
+        """A ``file://`` origin whose netloc coincidentally matches the Host
+        must not pass the same-origin branch — the scheme must be http/https."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("file://localhost:9889", "localhost:9889")
+                    is False
+                )
+
+    def test_userinfo_cannot_smuggle_trusted_host(self):
+        """A crafted Origin that puts the trusted Host in the userinfo segment
+        (``http://localhost:9889@evil.example``) has real authority
+        ``evil.example`` and must be rejected."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "http://localhost:9889@evil.example", "localhost:9889"
+                    )
+                    is False
+                )
+
+
+class TestOriginAuthorityMalformedInput:
+    """Regression for #653: origin parsing fed a malformed bracketed Origin
+    (e.g. ``http://[``) must not raise. ``urlsplit`` propagates
+    ``ValueError: Invalid IPv6 URL`` for such input, and both callers sit on
+    request paths (HTTP middleware, WS handshake) that must fail closed with
+    a 403, not a 500 from an unguarded exception.
+    """
+
+    def test_malformed_bracketed_origin_returns_none(self):
+        from cli_agent_orchestrator.constants import _origin_scheme_and_authority
+
+        assert _origin_scheme_and_authority("http://[") is None
+
+    def test_malformed_origin_is_rejected_not_raised_by_ws_guard(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://[", "localhost:9889") is False
+
+    def test_malformed_origin_is_rejected_not_raised_by_http_guard(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert constants.is_http_origin_allowed("http://[", "localhost:9889") is False
+
+
+class TestSchemeAwareSameOrigin:
+    """Regression for #653 item 2: the same-origin branch compared authority
+    (``host[:port]``) only, so a request that arrived over HTTPS accepted a
+    plain-``http`` Origin as same-origin. Under RFC 6454 an origin is the
+    (scheme, host, port) triple, so ``http://h`` and ``https://h`` are
+    different origins and the downgrade should not match.
+
+    The check is deliberately one-directional. It rejects an ``http`` Origin on
+    an ``https`` request, which is unambiguous. It does NOT reject an ``https``
+    Origin on a request that merely *looks* plain-http to the server, because
+    that is the shape produced by an HTTPS-terminating proxy whose address is
+    not in ``TRUSTED_FORWARDER_IPS`` — uvicorn then ignores
+    ``X-Forwarded-Proto`` and reports ``scheme='http'`` for a request the
+    browser genuinely made over TLS. Rejecting that direction would break
+    working reverse-proxy and Codespaces deployments without closing a real
+    hole, since forging it requires already controlling the victim's own
+    origin over TLS.
+    """
+
+    def test_https_request_rejects_http_origin(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "http://localhost:8765", "localhost:8765", scheme="https"
+                )
+                is False
+            )
+
+    def test_https_request_accepts_https_origin(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "https://localhost:8765", "localhost:8765", scheme="https"
+                )
+                is True
+            )
+
+    def test_http_request_accepts_http_origin(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "http://localhost:8765", "localhost:8765", scheme="http"
+                )
+                is True
+            )
+
+    def test_untrusted_proxy_shape_still_allowed(self):
+        """``scheme='http'`` + an ``https`` Origin is the untrusted-proxy shape;
+        allowed deliberately so TLS-terminating deployments keep working."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed(
+                    "https://localhost:8765", "localhost:8765", scheme="http"
+                )
+                is True
+            )
+
+    def test_omitting_scheme_preserves_previous_behaviour(self):
+        """Callers that do not pass a scheme keep the pre-#653 semantics."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            assert (
+                constants.is_http_origin_allowed("http://localhost:8765", "localhost:8765") is True
+            )
+
+    def test_explicit_allowlist_entry_is_not_scheme_gated(self):
+        """The scheme check guards the same-origin branch only; an operator who
+        lists an origin explicitly still gets it, as before."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:8765"]):
+            assert (
+                constants.is_http_origin_allowed(
+                    "http://localhost:8765", "localhost:8765", scheme="https"
+                )
+                is True
+            )
+
+    def test_ws_handshake_rejects_http_origin_over_wss(self):
+        """The WS scope reports ``wss``/``ws``, which map onto the ``https``/
+        ``http`` origin schemes the browser serializes."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "http://localhost:8765", "localhost:8765", scheme="wss"
+                    )
+                    is False
+                )
+
+    def test_ws_handshake_accepts_https_origin_over_wss(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "https://localhost:8765", "localhost:8765", scheme="wss"
+                    )
+                    is True
+                )
+
+
+class TestPipeLivenessCheckIntervalClamp:
+    """Regression for the round-3 Copilot review on #397: PIPE_LIVENESS_CHECK_INTERVAL_S
+    feeds ``threading.Event.wait(timeout)`` in the watchdog's poll loop
+    (services/fifo_reader.py's ``_watchdog_loop``) — a non-positive value makes
+    ``wait()`` return immediately every iteration, turning the periodic poll
+    into a hot spin (high CPU + a tmux ``capture-pane`` call as fast as the
+    loop can run). A non-positive value here is invalid for the parameter's
+    meaning, not just atypical, so it's treated the same way an unparseable
+    string already is: fall back to the default.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_zero_falls_back_to_default(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "0"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+    def test_negative_falls_back_to_default(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "-1.5"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+    def test_non_numeric_falls_back_to_default(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "not-a-number"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+    def test_positive_value_is_honored(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "0.5"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 0.5
+
+    def test_default_when_env_not_set(self):
+        mod = self._reload_constants({})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+
+class TestCaoHomeDir:
+    """Tests for CAO home directory constants."""
+
+    def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
+        """With CAO_HOME_DIR unset, CAO_HOME_DIR is ~/.aws/cli-agent-orchestrator.
+
+        The constant is read at import, so a CAO_HOME_DIR in the runner's
+        environment (``CAO_HOME_DIR=$(mktemp -d) pytest ...``) replaces the
+        default. Reload with it unset to check the default, then reload under
+        the original environment so later tests see the session's value.
+        """
+        import importlib
+        import os
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        env = {k: v for k, v in os.environ.items() if k != "CAO_HOME_DIR"}
+        try:
+            with patch.dict("os.environ", env, clear=True):
+                importlib.reload(constants_module)
+                expected = Path.home() / ".aws" / "cli-agent-orchestrator"
+                assert constants_module.CAO_HOME_DIR == expected
+        finally:
+            importlib.reload(constants_module)
+
+    def test_cao_home_dir_is_pathlib_path(self):
+        """Test that CAO_HOME_DIR is a Path object."""
+        from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+        assert isinstance(CAO_HOME_DIR, Path)
+
+    def test_db_dir_is_under_cao_home(self):
+        """Test that DB_DIR is under CAO_HOME_DIR."""
+        from cli_agent_orchestrator.constants import CAO_HOME_DIR, DB_DIR
+
+        assert DB_DIR == CAO_HOME_DIR / "db"
+
+    def test_local_agent_store_dir_is_under_cao_home(self):
+        """Test that LOCAL_AGENT_STORE_DIR is under CAO_HOME_DIR."""
+        from cli_agent_orchestrator.constants import CAO_HOME_DIR, LOCAL_AGENT_STORE_DIR
+
+        assert LOCAL_AGENT_STORE_DIR == CAO_HOME_DIR / "agent-store"
+
+    def test_skills_dir_is_under_cao_home(self):
+        """Test that SKILLS_DIR is under CAO_HOME_DIR."""
+        from cli_agent_orchestrator.constants import CAO_HOME_DIR, SKILLS_DIR
+
+        assert SKILLS_DIR == CAO_HOME_DIR / "skills"
+
+
+class TestCaoHomeDirEnvOverride:
+    """The ``CAO_HOME_DIR`` env var relocates CAO's entire data tree.
+
+    Some environments restrict access to ``~/.aws`` (where CAO stores its data
+    by default) to protect AWS credentials, which can leave CAO unable to read
+    its own agent profiles. Setting ``CAO_HOME_DIR`` moves the whole tree
+    elsewhere. The override is read at import, so a single reload must
+    propagate to every derived path.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_HOME_DIR", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def _reload_constants_and_settings(self, override):
+        """Reload constants, then settings_service, under a CAO_HOME_DIR override.
+
+        ``settings_service`` binds ``CAO_HOME_DIR`` at its own import time, so it
+        must be reloaded *after* constants for the override to reach its
+        ``_DEFAULTS`` agent-dir map. Passing ``None`` restores the defaults.
+        """
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_HOME_DIR", None)
+        if override is not None:
+            env_copy["CAO_HOME_DIR"] = str(override)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+            import cli_agent_orchestrator.services.settings_service as settings_module
+
+            importlib.reload(constants_module)
+            importlib.reload(settings_module)
+            return constants_module, settings_module
+
+    @pytest.fixture(autouse=True)
+    def _restore_default_constants(self):
+        # Reloading under an override mutates the shared modules in place; reload
+        # them back to their original-env state after each test so the override
+        # cannot leak into tests (here or in other files) that import directly.
+        import os
+
+        original_value = os.environ.get("CAO_HOME_DIR")
+        yield
+        self._reload_constants_and_settings(original_value)
+
+    def test_override_relocates_home_dir(self, tmp_path):
+        override = tmp_path / "cao-home"
+        mod = self._reload_constants({"CAO_HOME_DIR": str(override)})
+        assert mod.CAO_HOME_DIR == override.resolve()
+
+    def test_derived_paths_follow_override(self, tmp_path):
+        override = tmp_path / "cao-home"
+        mod = self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert mod.DB_DIR == resolved / "db"
+        assert mod.LOG_DIR == resolved / "logs"
+        assert mod.FIFO_DIR == resolved / "fifos"
+        assert mod.AGENT_CONTEXT_DIR == resolved / "agent-context"
+        assert mod.LOCAL_AGENT_STORE_DIR == resolved / "agent-store"
+        assert mod.SKILLS_DIR == resolved / "skills"
+        assert mod.MEMORY_BASE_DIR == resolved / "memory"
+        assert mod.DATABASE_FILE == resolved / "db" / "cli-agent-orchestrator.db"
+
+    def test_import_time_dirs_created_under_override(self, tmp_path):
+        # constants.py mkdirs TERMINAL_LOG_DIR and FIFO_DIR at import; under the
+        # override they must be created below the new root, never under ~/.aws.
+        override = tmp_path / "cao-home"
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert (resolved / "logs" / "terminal").is_dir()
+        assert (resolved / "fifos").is_dir()
+
+    def test_agent_dir_defaults_follow_override(self, tmp_path):
+        # Load-bearing for the restricted-~/.aws case: the agent-store and
+        # agent-context defaults used for the handoff profile read must relocate.
+        override = tmp_path / "cao-home"
+        _, settings_module = self._reload_constants_and_settings(override)
+        resolved = override.resolve()
+        assert settings_module._DEFAULTS["claude_code"] == str(resolved / "agent-store")
+        assert settings_module._DEFAULTS["codex"] == str(resolved / "agent-store")
+        assert settings_module._DEFAULTS["cao_installed"] == str(resolved / "agent-context")
+        # kiro_cli tracks ~/.kiro, not CAO_HOME_DIR, so it is intentionally unchanged.
+        assert settings_module._DEFAULTS["kiro_cli"] == str(Path.home() / ".kiro" / "agents")
+
+    def test_default_when_env_not_set(self):
+        mod = self._reload_constants({})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
+
+    def test_empty_string_treated_as_unset(self):
+        # An empty CAO_HOME_DIR (e.g. `export CAO_HOME_DIR=`) must not resolve
+        # to CWD; treat it as unset and fall back to the default.
+        mod = self._reload_constants({"CAO_HOME_DIR": ""})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
+
+    def test_whitespace_only_treated_as_unset(self):
+        mod = self._reload_constants({"CAO_HOME_DIR": "   "})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
+
+    def test_tilde_expanded(self, tmp_path):
+        # A literal ~/some-path must be expanded, not create a dir named "~".
+        mod = self._reload_constants({"CAO_HOME_DIR": "~/cao-test-data"})
+        expected = Path("~/cao-test-data").expanduser().resolve()
+        assert mod.CAO_HOME_DIR == expected
+        assert "~" not in str(mod.CAO_HOME_DIR)
+
+    def test_import_time_dirs_have_restricted_permissions(self, tmp_path):
+        # Directories created at import time must have no group/other access
+        # to protect secret-bearing terminal logs when relocated outside ~/.aws.
+        override = tmp_path / "cao-home"
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        # Base dir itself is hardened
+        assert resolved.stat().st_mode & 0o077 == 0
+        # Leaf dirs are hardened
+        terminal_log_dir = resolved / "logs" / "terminal"
+        fifo_dir = resolved / "fifos"
+        assert terminal_log_dir.stat().st_mode & 0o077 == 0
+        assert fifo_dir.stat().st_mode & 0o077 == 0
+
+    def test_pre_existing_base_dir_is_chmodded(self, tmp_path):
+        # If the base dir already exists with lax permissions, the import-time
+        # chmod tightens it to owner-only.
+        override = tmp_path / "cao-home"
+        override.mkdir(mode=0o755)
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert resolved.stat().st_mode & 0o077 == 0
+
+
+class TestSessionConstants:
+    """Tests for session configuration constants."""
+
+    def test_session_prefix(self):
+        """Test that SESSION_PREFIX is 'cao-'."""
+        from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+        assert SESSION_PREFIX == "cao-"
+
+
+class TestEventBusConstants:
+    """Tests for event bus configuration constants."""
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_EVENT_BUS_MAX_QUEUE_SIZE", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_event_bus_queue_size_falls_back_when_env_is_non_numeric(self):
+        mod = self._reload_constants({"CAO_EVENT_BUS_MAX_QUEUE_SIZE": "not-a-number"})
+
+        assert mod.EVENT_BUS_MAX_QUEUE_SIZE == 16384
+
+
+class TestTmuxHistoryLimitConstant:
+    """``TMUX_HISTORY_LIMIT`` is the scrollback floor CAO raises a shared tmux
+    server to (#728). An operator on a memory-constrained box needs a way to
+    lower or disable it, so it reads ``CAO_TMUX_HISTORY_LIMIT``."""
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_TMUX_HISTORY_LIMIT", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_default_matches_the_recommended_tmux_conf(self):
+        mod = self._reload_constants({})
+
+        assert mod.TMUX_HISTORY_LIMIT == 50000
+
+    def test_env_override_is_honoured(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "8000"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 8000
+
+    def test_zero_is_a_valid_value_meaning_never_raise(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "0"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 0
+
+    def test_non_numeric_falls_back_to_the_default(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "lots"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 50000
+
+
+class TestOpenCodeConstants:
+    """Tests for OpenCode provider path constants."""
+
+    def test_opencode_config_dir_resolves_correctly(self):
+        from pathlib import Path
+
+        from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR
+
+        assert OPENCODE_CONFIG_DIR == Path.home() / ".aws" / "opencode"
+
+    def test_opencode_agents_dir_is_under_config_dir(self):
+        from cli_agent_orchestrator.constants import OPENCODE_AGENTS_DIR, OPENCODE_CONFIG_DIR
+
+        assert OPENCODE_AGENTS_DIR == OPENCODE_CONFIG_DIR / "agents"
+
+    def test_opencode_config_file_is_json(self):
+        from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
+
+        assert OPENCODE_CONFIG_FILE == OPENCODE_CONFIG_DIR / "opencode.json"
+        assert OPENCODE_CONFIG_FILE.suffix == ".json"
+
+    def test_opencode_config_dir_is_pathlib_path(self):
+        from pathlib import Path
+
+        from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR
+
+        assert isinstance(OPENCODE_CONFIG_DIR, Path)
+
+    def test_opencode_cli_in_providers_list(self):
+        from cli_agent_orchestrator.constants import PROVIDERS
+
+        assert "opencode_cli" in PROVIDERS
+
+
+class TestOpenCodeProviderType:
+    """Tests for OPENCODE_CLI entry in ProviderType enum."""
+
+    def test_opencode_cli_enum_value(self):
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert ProviderType.OPENCODE_CLI.value == "opencode_cli"
+
+    def test_opencode_cli_importable(self):
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert hasattr(ProviderType, "OPENCODE_CLI")
+
+
+class TestGrokCliProviderType:
+    """Tests for the official xAI Grok Build provider registration."""
+
+    def test_grok_cli_enum_value(self):
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert ProviderType.GROK_CLI.value == "grok_cli"
+
+    def test_grok_cli_in_providers_list(self):
+        from cli_agent_orchestrator.constants import PROVIDERS
+
+        assert "grok_cli" in PROVIDERS

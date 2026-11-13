@@ -1,0 +1,287 @@
+"""TmuxBackend — concrete TerminalBackend implementation wrapping TmuxClient.
+
+This backend delegates all operations to the existing TmuxClient, preserving
+identical behavior for all callers. It serves as the default backend when
+no alternative is configured.
+"""
+
+import logging
+from typing import Dict, List, Optional, Tuple
+
+from cli_agent_orchestrator.backends.base import (
+    TerminalBackend,
+    TerminalBackendError,
+    TerminalCleanupResult,
+)
+from cli_agent_orchestrator.clients.tmux import (
+    DEFAULT_PANE_LAYOUT,
+    PaneSpawnUnavailable,
+    TmuxClient,
+    web_view_attach_argv,
+)
+from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+
+logger = logging.getLogger(__name__)
+
+# See TmuxBackend.web_input_escape_hold.
+_TMUX_ESCAPE_HOLD_FLOOR_MS = 500
+_TMUX_ESCAPE_HOLD_MARGIN_MS = 50
+
+# The window pane-mode terminals share. Named rather than "the current window"
+# so a spawn triggered from anywhere lands in one place; the first pane-mode
+# terminal in a session creates it.
+DEFAULT_PANE_WINDOW = "cao-agents"
+
+# Anything else is a typo, and a typo must not silently turn the feature off.
+SPAWN_MODES = frozenset({"window", "pane"})
+
+
+class TmuxBackend(TerminalBackend):
+    """TerminalBackend implementation backed by tmux via TmuxClient."""
+
+    def __init__(
+        self,
+        client: Optional[TmuxClient] = None,
+        spawn_mode: str = "window",
+        pane_window: str = DEFAULT_PANE_WINDOW,
+        pane_layout: str = DEFAULT_PANE_LAYOUT,
+    ) -> None:
+        """Initialize with an optional TmuxClient (defaults to module singleton).
+
+        ``spawn_mode="pane"`` puts every terminal after the first into
+        ``pane_window`` as a pane, so a supervisor watches its whole fleet in
+        one view instead of one window per agent. ``pane_layout`` is how that
+        window is re-arranged after each spawn.
+        """
+        if client is None:
+            if spawn_mode == "pane":
+                # Its own client, not the module singleton: pane mode changes how
+                # a terminal is addressed, and nothing else sharing that singleton
+                # asked for it.
+                client = TmuxClient(pane_mode=True)
+            else:
+                from cli_agent_orchestrator.clients.tmux import tmux_client
+
+                client = tmux_client
+        self._client = client
+        self._spawn_mode = spawn_mode
+        self._pane_window = pane_window
+        self._pane_layout = pane_layout
+
+    # --- Session lifecycle ---
+
+    def create_session(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        try:
+            return self._client.create_session(
+                session_name, window_name, terminal_id, working_directory, extra_env=extra_env
+            )
+        except Exception as e:
+            raise TerminalBackendError(f"Failed to create session '{session_name}': {e}") from e
+
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        try:
+            self._client.restore_session_env(session_name, key, launch_value)
+        except Exception as e:
+            raise TerminalBackendError(
+                f"Failed to restore {key} in session '{session_name}': {e}"
+            ) from e
+
+    def session_exists(self, session_name: str) -> bool:
+        return self._client.session_exists(session_name)
+
+    def session_exists_strict(self, session_name: str) -> bool:
+        return self._client.session_exists_strict(session_name)
+
+    def list_sessions(self) -> List[Dict[str, str]]:
+        return self._client.list_sessions()
+
+    def kill_session(self, session_name: str) -> bool:
+        return self._client.kill_session(session_name)
+
+    # --- Window/tab lifecycle ---
+
+    def create_window(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+        window_shell: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        try:
+            if self._spawn_mode == "pane":
+                try:
+                    return self._client.create_pane(
+                        session_name,
+                        self._pane_window,
+                        window_name,
+                        terminal_id,
+                        working_directory,
+                        window_shell,
+                        extra_env=extra_env,
+                        pane_layout=self._pane_layout,
+                    )
+                except PaneSpawnUnavailable as e:
+                    # Only this case falls back: tmux has no room for another
+                    # pane in the host window. A duplicate name or a refused
+                    # directory must still fail.
+                    logger.warning(f"Pane spawn for '{window_name}' fell back to a window: {e}")
+            return self._client.create_window(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                window_shell,
+                extra_env=extra_env,
+            )
+        except Exception as e:
+            raise TerminalBackendError(
+                f"Failed to create window '{window_name}' in session '{session_name}': {e}"
+            ) from e
+
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        return self._client.kill_window(session_name, window_name)
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        return self._client.cleanup_terminal_exact(
+            terminal_id, session_name, window_name, close=close
+        )
+
+    # --- Input ---
+
+    def send_keys(
+        self,
+        session_name: str,
+        window_name: str,
+        keys: str,
+        enter_count: int = 1,
+        force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
+    ) -> None:
+        self._client.send_keys(
+            session_name,
+            window_name,
+            keys,
+            enter_count=enter_count,
+            force_bracketed_paste=force_bracketed_paste,
+            submit_delay=submit_delay,
+        )
+
+    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+        self._client.send_special_key(session_name, window_name, key)
+
+    # --- Output ---
+
+    @property
+    def max_history_lines(self) -> int:
+        # The per-pane scrollback floor TmuxClient raises history-limit to
+        # before every pane is created (#728). A pane may retain more if the
+        # operator configured more; capture-pane never returns more than the
+        # pane retains, so this is the depth CAO can count on.
+        return TMUX_HISTORY_LIMIT
+
+    def get_history(
+        self,
+        session_name: str,
+        window_name: str,
+        tail_lines: Optional[int] = None,
+        strip_escapes: bool = False,
+        full_history: bool = False,
+        visible_only: bool = False,
+        join_wrapped: bool = False,
+    ) -> str:
+        return self._client.get_history(
+            session_name,
+            window_name,
+            tail_lines=tail_lines,
+            strip_escapes=strip_escapes,
+            full_history=full_history,
+            visible_only=visible_only,
+            join_wrapped=join_wrapped,
+        )
+
+    def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
+        return self._client.get_pane_working_directory(session_name, window_name)
+
+    def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
+        return self._client.get_pane_current_command(session_name, window_name)
+
+    # --- Attach ---
+
+    def attach_session(self, session_name: str) -> None:
+        """Attach to tmux session via subprocess (replaces current process)."""
+        import subprocess
+
+        subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
+
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Return the tmux command used by the browser PTY WebSocket.
+
+        Attaches a private view session rather than the agent's session itself,
+        so several browser terminals on one session each keep their own window
+        (see ``web_view_attach_argv``).
+        """
+        if self._spawn_mode != "pane":
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}")
+        # Only pane mode has to ask tmux where the terminal is; the window-mode
+        # target is a pure function of its arguments and stays one.
+        return self._client.web_view_attach_command(session_name, window_name)
+
+    def prepare_web_attach_input(
+        self, session_name: str, window_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The browser attach argv, plus ``(window_id, pane_id)`` in pane mode.
+
+        In pane mode several agents are panes of one window, and tmux keeps one
+        active pane per window, not per client: keys from any browser terminal
+        on that window go to whichever pane is active. The handler serialises
+        input per window and selects the pane before each write. Argv and pane
+        come from one lookup; a lookup that fails refuses the attach.
+        """
+        if self._spawn_mode != "pane":
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}"), None
+        try:
+            return self._client.web_view_attach_plan(session_name, window_name)
+        except Exception as e:  # noqa: BLE001 — TmuxLookupError, or libtmux with the server gone
+            raise TerminalBackendError(
+                f"Could not locate terminal '{session_name}:{window_name}': {e}"
+            ) from e
+
+    def web_input_escape_hold(self) -> float:
+        """tmux's ``escape-time``, floored at 500 ms, plus a margin.
+
+        tmux keeps a trailing Escape as a partial key for ``escape-time`` (10 ms
+        by default since 3.5, 500 ms before), and for at least 500 ms while it
+        still waits for the client's answers to its own terminal queries, which
+        is just after an attach. The floor covers both.
+        """
+        configured = self._client.escape_time_ms()
+        floor_ms = _TMUX_ESCAPE_HOLD_FLOOR_MS
+        ms = max(configured if configured is not None else floor_ms, floor_ms)
+        return (ms + _TMUX_ESCAPE_HOLD_MARGIN_MS) / 1000
+
+    def focus_web_input(self, target: str) -> None:
+        self._client.select_pane(target)
+
+    # --- Pipe-pane ---
+
+    def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
+        self._client.pipe_pane(session_name, window_name, file_path)
+
+    def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
+        self._client.stop_pipe_pane(session_name, window_name)

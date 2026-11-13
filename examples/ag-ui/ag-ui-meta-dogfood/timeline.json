@@ -1,0 +1,35 @@
+[
+  {
+    "id": "5486ac47-00cc-44c2-889d-9392059a1c47",
+    "kind": "delegation",
+    "orchestration_type": "assign",
+    "sender": "t-supervisor",
+    "receiver": "t-developer",
+    "tool_call_name": "assign",
+    "started_at": "2026-11-07T21:57:48.169555+00:00",
+    "ended_at": null,
+    "status": "open"
+  },
+  {
+    "id": "89dbda2a-0e2a-4815-9a3e-93ba291dbb3c",
+    "kind": "delegation",
+    "orchestration_type": "handoff",
+    "sender": "t-developer",
+    "receiver": "t-reviewer",
+    "tool_call_name": "handoff",
+    "started_at": "2026-11-07T21:57:48.169621+00:00",
+    "ended_at": null,
+    "status": "open"
+  },
+  {
+    "id": "db2a7b38-6667-4449-8acf-43854027b8af",
+    "kind": "delegation",
+    "orchestration_type": "handoff",
+    "sender": "t-reviewer",
+    "receiver": "t-supervisor",
+    "tool_call_name": "handoff",
+    "started_at": "2026-11-07T21:57:48.189058+00:00",
+    "ended_at": null,
+    "status": "open"
+  }
+]

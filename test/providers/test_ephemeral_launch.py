@@ -1,0 +1,474 @@
+"""Launch paths must not turn an unavailable ephemeral into a native agent."""
+
+import json
+from test.services.test_ephemeral_service import create_store  # noqa: F401
+from test.utils.test_agent_profiles_ephemeral import DOCUMENT, NAME, stores  # noqa: F401
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from cli_agent_orchestrator.providers import claude_code, codex
+from cli_agent_orchestrator.utils import agent_profiles as profiles
+
+
+@pytest.mark.parametrize(
+    "module, cls", [(claude_code, claude_code.ClaudeCodeProvider), (codex, codex.CodexProvider)]
+)
+def test_missing_ephemeral_provider_fails_closed(stores, module, cls):
+    provider = cls("abcd1234", "session", "window", NAME)
+    if module is codex:
+        assert provider._try_load_profile() is None
+        with pytest.raises(module.ProviderError):
+            provider._build_codex_command()
+    else:
+        with pytest.raises(module.ProviderError):
+            provider._load_profile()
+
+
+@pytest.mark.parametrize("provider", ["claude_code", "copilot_cli"])
+@pytest.mark.asyncio
+async def test_server_refuses_before_provider_init(stores, monkeypatch, provider):
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    backend = Mock()
+    backend.session_exists.return_value = True
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    init = AsyncMock()
+    factory = Mock(return_value=Mock(initialize=init))
+    monkeypatch.setattr(service.ProviderManager, "create_provider", factory)
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: None)
+    with pytest.raises(EphemeralPolicyError, match="unknown_ephemeral"):
+        await service.create_terminal(provider, NAME, session_name="session")
+    factory.assert_not_called()
+    init.assert_not_called()
+    backend.create_window.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "module, cls", [(claude_code, claude_code.ClaudeCodeProvider), (codex, codex.CodexProvider)]
+)
+def test_ephemeral_skips_installed_plugin_mcp(stores, monkeypatch, tmp_path, module, cls):
+    from cli_agent_orchestrator.agent_plugins import mcp_delivery
+
+    _, live = stores
+    doc = DOCUMENT.replace(
+        "provider: claude_code",
+        "provider: claude_code\nmcpServers:\n  cao-mcp-server:\n    command: cao-mcp-server\n    args: []",
+    )
+    (live / f"{NAME}.md").write_text(doc)
+    from test.agent_plugins.conftest import build_plugin
+
+    from cli_agent_orchestrator.agent_plugins.installer import install
+    from cli_agent_orchestrator.agent_plugins.models import PluginSource
+    from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
+
+    plugin_store = InstalledPluginStore(
+        plugins_dir=tmp_path / "plugins", data_dir=tmp_path / "data"
+    )
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    monkeypatch.setenv("CAO_AGENT_PLUGINS_ENABLED", "1")
+    monkeypatch.setattr("cli_agent_orchestrator.agent_plugins.projection.SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("cli_agent_orchestrator.agent_plugins.store.AGENT_PLUGINS_DIR", tmp_path)
+    source = build_plugin(
+        tmp_path / "plugin-src",
+        "mcpdonor",
+        skills=[],
+        mcp_text=json.dumps(
+            {
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                "mcpServers": {"plugin-server": {"type": "stdio", "command": "plugin"}},
+            }
+        ),
+    )
+    install(
+        PluginSource(kind="path", location=str(source)),
+        store=plugin_store,
+        skills_dir=skills_dir,
+        refresh_agents=False,
+    )
+    monkeypatch.setattr(mcp_delivery, "InstalledPluginStore", lambda *a, **k: plugin_store)
+    installed = profiles.parse_agent_profile_text(doc, "ordinary")
+    assert (
+        "plugin-server"
+        in mcp_delivery.with_plugin_mcp(installed, module.__name__.split(".")[-1]).mcpServers
+    )
+    merge = Mock(wraps=module._with_plugin_mcp)
+    monkeypatch.setattr(module, "_with_plugin_mcp", merge)
+    monkeypatch.setattr(module, "CAO_HOME_DIR", tmp_path)
+    provider = cls("abcd1234", "session", "window", NAME)
+    if module is claude_code:
+        command = provider._build_claude_command()
+        config = json.loads((tmp_path / "tmp" / "abcd1234.mcp.json").read_text())
+        assert set(config["mcpServers"]) == {"cao-mcp-server"}
+        assert "--strict-mcp-config" in command
+    else:
+        assert provider._try_load_profile().name == NAME
+        command = provider._build_codex_command()
+        assert "plugin-server" not in command
+        assert "mcp_servers.cao-mcp-server" in command
+    merge.assert_not_called()
+
+
+@pytest.mark.parametrize("provider", ["claude_code", "codex", "copilot_cli", "kiro_cli"])
+@pytest.mark.asyncio
+async def test_stored_ephemeral_never_allocates_runtime(stores, monkeypatch, provider):
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    (stores[1] / f"{NAME}.md").write_text(DOCUMENT)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    backend = Mock()
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    id_generator = Mock(side_effect=AssertionError("no allocation"))
+    insert = Mock(side_effect=AssertionError("no terminal row"))
+    factory = Mock(side_effect=AssertionError("no provider"))
+    monkeypatch.setattr(service, "generate_terminal_id", id_generator)
+    monkeypatch.setattr(service, "db_create_terminal", insert)
+    monkeypatch.setattr(service.provider_manager, "create_provider", factory)
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: None)
+    with pytest.raises(EphemeralPolicyError, match="unknown_ephemeral"):
+        await service.create_terminal(provider, NAME, session_name="cao-session")
+    id_generator.assert_not_called()
+    insert.assert_not_called()
+    factory.assert_not_called()
+    backend.create_window.assert_not_called()
+
+
+@pytest.mark.parametrize("route,status", [("session", 404), ("terminal", 404), ("run_step", 404)])
+def test_launch_routes_map_ephemeral_policy_refusals(stores, monkeypatch, route, status):
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    (stores[1] / f"{NAME}.md").write_text(DOCUMENT)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(service, "get_backend", lambda: Mock())
+
+    async def launch(*args, **kwargs):
+        return await service.create_terminal("claude_code", NAME, session_name="cao-session")
+
+    from cli_agent_orchestrator.plugins.registry import PluginRegistry
+
+    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setattr(main.session_service, "create_session", launch)
+    monkeypatch.setattr(main, "run_agent_step", launch)
+    from cli_agent_orchestrator.clients import database
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: None)
+    client = TestClient(main.app, base_url="http://localhost")
+    params = {"agent_profile": NAME, "provider": "claude_code"}
+    if route == "session":
+        response = client.post("/sessions", params=params)
+    elif route == "terminal":
+        # An in-session create names its creating terminal; the ephemeral
+        # refusal fires before that caller's row is consulted.
+        response = client.post(
+            "/sessions/cao-session/terminals", params={**params, "caller_id": "0000beef"}
+        )
+    else:
+        response = client.post(
+            "/terminals/run-step",
+            json={"provider": "claude_code", "agent": NAME, "prompt": "Inspect logs."},
+        )
+    assert response.status_code == status, response.text
+    assert response.json()["detail"]["kind"] == "ephemeral_policy"
+    assert response.json()["detail"]["rule"] == "unknown_ephemeral"
+
+
+@pytest.mark.asyncio
+async def test_installed_profile_passes_launch_refusal(stores, monkeypatch):
+    monkeypatch.setattr(profiles, "resolve_env_vars", lambda text: text)
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    (stores[0] / "ordinary.md").write_text(DOCUMENT.replace(NAME, "ordinary"))
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    backend = Mock()
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    reached = Mock(side_effect=RuntimeError("installed launch reached allocation"))
+    monkeypatch.setattr(service, "generate_terminal_id", reached)
+    with pytest.raises(RuntimeError, match="installed launch reached allocation"):
+        await service.create_terminal("claude_code", "ordinary", session_name="cao-session")
+    reached.assert_called_once()
+
+
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, provider_name):
+    import shlex
+    from test.services.test_ephemeral_service import CALLER, SPEC, create
+
+    from cli_agent_orchestrator.services import ephemeral_service
+    from cli_agent_orchestrator.utils.tool_mapping import (
+        get_disallowed_tools,
+        get_launch_disallowed_tools,
+    )
+
+    env = create_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    name = create(env, {**SPEC, "provider": provider_name})["name"]
+    tools = ["fs_read", "@cao-mcp-server"]
+    module = claude_code if provider_name == "claude_code" else codex
+    cls = module.ClaudeCodeProvider if provider_name == "claude_code" else module.CodexProvider
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    helper = {"ephemeral": True} if provider_name == "claude_code" else {}
+    provider = cls("eeeeeeee", "cao-session", "child", name, allowed_tools=tools, **helper)
+    profile = (
+        provider._load_profile() if provider_name == "claude_code" else provider._try_load_profile()
+    )
+    prefix, suffix = ephemeral_service.render_prompt_parts(name, CALLER, SPEC["purpose"], tools)
+    assert profile.system_prompt == prefix + SPEC["brief"] + suffix
+    assert ephemeral_service.FENCE_SENTENCE in profile.system_prompt
+    if provider_name == "claude_code":
+        command = provider._build_claude_command(profile)
+        args = shlex.split(command.split("; ")[-1])
+        blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+        assert blocked == get_launch_disallowed_tools("claude_code", tools, ephemeral=True)
+        assert set(get_disallowed_tools("claude_code", tools)) < set(blocked)
+        for tool in _EPHEMERAL_HELPER_CUT:
+            assert blocked.count(tool) == 1, tool
+        # Claude Code's own messaging tool is cut; CAO's send_message is not.
+        assert "SendMessage" in blocked and "ListAgents" in blocked
+        assert [tool for tool in blocked if tool.startswith(("mcp__", "@"))] == []
+        prompt_file = env[2] / "tmp" / "eeeeeeee.prompt"
+        assert prompt_file.read_text() == profile.system_prompt
+        config = json.loads((env[2] / "tmp" / "eeeeeeee.mcp.json").read_text())
+        assert set(config["mcpServers"]) == {"cao-mcp-server"}
+        assert config["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "eeeeeeee"
+    else:
+        command = provider._build_codex_command()
+        assert "--yolo" in command
+        prompt_file = provider._developer_instructions_file_path()
+        assert json.loads(prompt_file.read_text()).endswith(profile.system_prompt)
+        assert prompt_file.stat().st_mode & 0o777 == 0o600
+        provider.cleanup()
+        assert not prompt_file.exists()
+
+
+_EPHEMERAL_HELPER_CUT = (
+    "Agent",
+    "Task",
+    "Monitor",
+    "Skill",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_name, stored, launched",
+    [
+        ("claude_code", ["fs_read"], None),
+        ("codex", ["fs_read"], None),
+        # A launch may narrow the stored grant; the archive records the narrowed list.
+        ("claude_code", ["fs_read", "fs_list"], ["fs_read", "@cao-mcp-server"]),
+    ],
+)
+async def test_a_helper_launch_carries_the_helper_cut_and_records_it(
+    create_store, monkeypatch, provider_name, stored, launched
+):
+    """End to end: the Claude Code helper's argv carries the seven
+    once and its bound event records that exact list; a Codex helper is unchanged."""
+    import shlex
+    from test.services.test_ephemeral_claim import audit
+    from test.services.test_ephemeral_service import CALLER, SPEC, create
+
+    from cli_agent_orchestrator.services import terminal_service as service
+    from cli_agent_orchestrator.utils.tool_mapping import get_launch_disallowed_tools
+
+    env = create_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    name = create(env, {**SPEC, "provider": provider_name, "tools": stored})["name"]
+    token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
+    module = claude_code if provider_name == "claude_code" else codex
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    backend = Mock()
+    backend.session_exists.return_value = True
+    backend.create_window.return_value = "child"
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(service, "generate_terminal_id", lambda: "eeeeeeee")
+    monkeypatch.setattr(service, "_resolve_working_directory", lambda _: str(env[2]))
+    monkeypatch.setattr(service, "build_skill_catalog", lambda _: None)
+    monkeypatch.setattr(service, "get_herdr_inbox_service", lambda: None)
+    seen = {}
+
+    def factory(*args, **kwargs):
+        seen["kwargs"] = kwargs
+        if provider_name == "claude_code":
+            provider = claude_code.ClaudeCodeProvider(
+                *args[1:5],
+                allowed_tools=args[5],
+                skill_prompt=kwargs["skill_prompt"],
+                ephemeral=kwargs.get("ephemeral", False),
+            )
+        else:
+            provider = codex.CodexProvider(
+                *args[1:5], allowed_tools=args[5], skill_prompt=kwargs["skill_prompt"]
+            )
+
+        async def init():
+            seen["command"] = (
+                provider._build_claude_command()
+                if provider_name == "claude_code"
+                else provider._build_codex_command()
+            )
+
+        provider.initialize = init
+        return provider
+
+    monkeypatch.setattr(service.provider_manager, "create_provider", factory)
+    terminal = await service.create_terminal(
+        provider_name,
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        claim_id=token,
+        **({"allowed_tools": launched} if launched is not None else {}),
+    )
+    (bound,) = [e for e in audit(name)["events"] if e["event"] == "bound"]
+    if launched is not None:
+        assert terminal.allowed_tools == launched and bound["effective_tools"] == launched
+    args = shlex.split(seen["command"].split("; ")[-1])
+    blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+    if provider_name == "claude_code":
+        assert seen["kwargs"]["ephemeral"] is True
+        for tool in _EPHEMERAL_HELPER_CUT:
+            assert blocked.count(tool) == 1, tool
+        assert blocked == bound["disallowed_tools"]
+        assert blocked == get_launch_disallowed_tools(
+            "claude_code", terminal.allowed_tools, ephemeral=True
+        )
+        if launched is not None:
+            # The narrowed grant dropped fs_list, so the recorded list must cut it too.
+            assert "Glob" in blocked and "Grep" in blocked
+    else:
+        assert "ephemeral" not in seen["kwargs"]
+        assert "disallowed_tools" not in bound
+        assert blocked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+@pytest.mark.parametrize("tier", [None, "small"])
+@pytest.mark.parametrize("effort", [None, "high"])
+async def test_A_L1_A_L2_mapped_model_launch(
+    create_store, monkeypatch, provider_name, tier, effort
+):
+    import shlex
+    from test.services.test_ephemeral_service import CALLER, SPEC, create
+    from test.services.test_ephemeral_tier_policy import mapped
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    env = create_store
+    mapped(env[4])
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    spec = {**SPEC, "provider": provider_name, **({"model_tier": tier} if tier else {})}
+    if effort is not None:
+        spec["effort"] = effort
+    result = create(env, spec)
+    name = result["name"]
+    token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
+    module = claude_code if provider_name == "claude_code" else codex
+    cls = module.ClaudeCodeProvider if provider_name == "claude_code" else module.CodexProvider
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    backend = Mock()
+    backend.session_exists.return_value = True
+    backend.create_window.return_value = "child"
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(service, "generate_terminal_id", lambda: "eeeeeeee")
+    monkeypatch.setattr(service, "_resolve_working_directory", lambda _: str(env[2]))
+    monkeypatch.setattr(service, "build_skill_catalog", lambda _: None)
+    monkeypatch.setattr(service, "get_herdr_inbox_service", lambda: None)
+    commands = []
+
+    def factory(*args, **kwargs):
+        provider = cls(
+            *args[1:5],
+            allowed_tools=args[5],
+            skill_prompt=kwargs["skill_prompt"],
+            model=kwargs["model"],
+        )
+
+        async def init():
+            command = (
+                provider._build_claude_command()
+                if provider_name == "claude_code"
+                else provider._build_codex_command()
+            )
+            commands.append(command)
+
+        provider.initialize = init
+        return provider
+
+    monkeypatch.setattr(service.provider_manager, "create_provider", factory)
+    terminal = await service.create_terminal(
+        provider_name, name, session_name="cao-session", caller_id=CALLER, claim_id=token
+    )
+    args = shlex.split(commands[0].split("; ")[-1])
+    model = env[4]["model_tiers"][provider_name][tier] if tier else None
+    assert args.count("--model") == (1 if tier else 0)
+    if tier:
+        assert args[args.index("--model") + 1] == model
+    if provider_name == "claude_code":
+        assert args.count("--effort") == (1 if effort else 0)
+        if effort:
+            assert args[args.index("--effort") + 1] == effort
+    else:
+        item = f'model_reasoning_effort="{effort}"'
+        assert args.count(item) == (1 if effort else 0)
+        if effort:
+            pos = args.index(item)
+            assert args[pos - 1] == "-c"
+            assert pos < args.index("check_for_update_on_startup=false")
+            assert pos > next(
+                i
+                for i, arg in enumerate(args)
+                if arg.startswith("mcp_servers.cao-mcp-server.command=")
+            )
+    row = database.get_terminal_metadata(terminal.id)
+    assert row["model"] == model and row["model_honored"] is True
+
+
+@pytest.mark.parametrize("load", ["claude", "codex_command", "codex_timeout"])
+@pytest.mark.parametrize("tampered", [False, True])
+def test_provider_reload_verifies_finalized_bytes(create_store, monkeypatch, load, tampered):
+    from test.services.test_ephemeral_service import CALLER, create
+
+    env = create_store
+    name = create(env)["name"]
+    token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
+    assert token
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    if tampered:
+        path.write_bytes(path.read_bytes() + b"\nChanged after finalize.\n")
+    module = claude_code if load == "claude" else codex
+    cls = module.ClaudeCodeProvider if load == "claude" else module.CodexProvider
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    provider = cls("eeeeeeee", "cao-session", "child", name)
+    if load == "codex_timeout":
+        profile = provider._try_load_profile()
+        assert (profile is None) == tampered
+    elif load == "claude":
+        if tampered:
+            with pytest.raises(module.ProviderError):
+                provider._load_profile()
+        else:
+            assert provider._load_profile().name == name
+    elif tampered:
+        with pytest.raises(module.ProviderError):
+            provider._build_codex_command()
+    else:
+        assert "codex" in provider._build_codex_command()

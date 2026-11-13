@@ -1,0 +1,1967 @@
+"""Tests for TmuxClient methods (mocked libtmux — no real tmux required).
+
+The one exception is ``TestRealTmuxExitEmpty`` at the bottom of this file,
+which is deliberately NOT mocked — see its module docstring for why.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+
+
+@pytest.fixture
+def tmux():
+    """Create a TmuxClient with a mocked libtmux.Server."""
+    with patch("cli_agent_orchestrator.clients.tmux.libtmux") as mock_libtmux:
+        mock_server = MagicMock()
+        # Sane default for server.cmd(): a successful tmux_cmd-shaped result.
+        # A bare MagicMock() has a non-zero-comparing .returncode and a
+        # non-iterable .stderr, so any test that does not care about the
+        # underlying tmux invocation's outcome still gets a "success" shape
+        # (see _set_server_exit_empty_off, which checks .returncode/.stderr
+        # explicitly because libtmux 0.51's Server.cmd() does not raise on
+        # tmux command failure).
+        mock_server.cmd.return_value = MagicMock(returncode=0, stdout=[], stderr=[])
+        mock_libtmux.Server.return_value = mock_server
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        client = TmuxClient()
+        client.server = mock_server
+        yield client
+
+
+# ── _resolve_and_validate_working_directory ──────────────────────────
+
+
+class TestResolveAndValidateWorkingDirectory:
+    def test_defaults_to_cwd(self, tmux, tmp_path):
+        with patch("os.getcwd", return_value=str(tmp_path)):
+            result = tmux._resolve_and_validate_working_directory(None)
+        assert result == os.path.realpath(str(tmp_path))
+
+    def test_valid_directory(self, tmux, tmp_path):
+        result = tmux._resolve_and_validate_working_directory(str(tmp_path))
+        assert result == os.path.realpath(str(tmp_path))
+
+    def test_blocked_root(self, tmux):
+        with pytest.raises(ValueError, match="blocked system path"):
+            tmux._resolve_and_validate_working_directory("/")
+
+    def test_blocked_etc(self, tmux):
+        with pytest.raises(ValueError, match="blocked system path"):
+            tmux._resolve_and_validate_working_directory("/etc")
+
+    def test_nonexistent_directory(self, tmux):
+        with pytest.raises(ValueError, match="does not exist"):
+            tmux._resolve_and_validate_working_directory("/nonexistent/dir/xyz")
+
+
+# ── create_session ───────────────────────────────────────────────────
+
+
+class TestCreateSession:
+    def test_create_session_success(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        assert result == "my-window"
+        tmux.server.new_session.assert_called_once()
+
+    def test_create_session_disables_exit_empty(self, tmux, tmp_path):
+        """harness-control#845: creating a session must set the server-wide
+        'exit-empty off' option (before new_session) so a transient empty moment
+        during a mass teardown can't take the whole tmux server down.
+
+        The option is applied via a single ``start-server ; set-option ...``
+        tmux invocation (not two separate ``server.cmd()`` calls): a bare
+        clean-server ``set-option`` never starts the server (see
+        ``_set_server_exit_empty_off``'s docstring), and two SEPARATE
+        commands ("start-server" then "set-option") still lose the race,
+        because a server started with zero sessions evaluates the tmux
+        default ``exit-empty on`` and can exit again before the second,
+        separate client process connects.
+        """
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        tmux.server.cmd.assert_any_call(
+            "start-server", ";", "set-option", "-s", "exit-empty", "off"
+        )
+
+    def test_disables_exit_empty_before_new_session(self, tmux, tmp_path):
+        """Copilot review (PR #599): ``assert_any_call`` only proves the call
+        happened at SOME point, not that it happened before ``new_session`` —
+        a regression that reordered the two would pass it unnoticed. Assert
+        call ORDER instead, via ``mock_calls`` on the shared parent mock.
+        """
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        call_names = [c[0] for c in tmux.server.mock_calls if c[0] in ("cmd", "new_session")]
+        assert "cmd" in call_names
+        assert "new_session" in call_names
+        assert call_names.index("cmd") < call_names.index(
+            "new_session"
+        ), f"expected 'cmd' (exit-empty) before 'new_session', got order: {call_names}"
+
+    def test_exit_empty_nonzero_returncode_does_not_block_launch(self, tmux, tmp_path):
+        """libtmux 0.51's Server.cmd() RETURNS a failed tmux_cmd result instead
+        of raising (this is exactly the shape that hid the reviewer-reported
+        P2: a clean-server 'error connecting ...' status-1 result that no
+        exception ever surfaced). Setting exit-empty is best-effort: a
+        nonzero returncode must be logged, not raised, and must NOT abort the
+        launch.
+        """
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+        tmux.server.cmd.return_value = MagicMock(
+            returncode=1,
+            stdout=[],
+            stderr=["error connecting to /tmp/tmux-0/default (No such file or directory)"],
+        )
+
+        result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        assert result == "my-window"
+
+    def test_exit_empty_failure_does_not_block_launch(self, tmux, tmp_path):
+        """Setting exit-empty is best-effort: a failure must NOT abort the launch."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+        tmux.server.cmd.side_effect = RuntimeError("tmux unavailable")
+
+        # Must still succeed despite the set-option failure.
+        result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+        assert result == "my-window"
+
+    def test_exit_empty_is_retried_once_after_a_failed_set(self, tmux, tmp_path, caplog):
+        """A create right after an external ``kill-server`` can reach the old
+        server while it is still exiting, and tmux reports ``server exited
+        unexpectedly``. The set is retried once, and a retry that succeeds
+        leaves nothing to warn about."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+        tmux.server.cmd.side_effect = [
+            MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),
+            # history-limit read: the fresh server's default (#728)
+            MagicMock(returncode=0, stdout=["history-limit 2000"], stderr=[]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),  # history-limit set (#728)
+        ]
+
+        with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
+            tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        exit_empty = call("start-server", ";", "set-option", "-s", "exit-empty", "off")
+        assert tmux.server.cmd.call_args_list == [
+            exit_empty,
+            exit_empty,
+            _READ_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+        ]
+        mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
+        assert "exit-empty" not in caplog.text
+
+    def test_create_session_window_name_none(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = None
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        with pytest.raises(ValueError, match="Window name is None"):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+
+    def test_create_session_raises_on_failure(self, tmux, tmp_path):
+        tmux.server.new_session.side_effect = Exception("tmux error")
+
+        with pytest.raises(Exception, match="tmux error"):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+
+    def test_create_session_enables_mouse(self, tmux, tmp_path):
+        """Mouse mode keeps wheel scroll inside tmux (#546): without it tmux
+        forwards wheel events to the foreground application as Up/Down keys,
+        so agent TUIs walk their input history instead of scrolling output.
+        Session-level option: the user's other sessions are untouched."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        mock_session.set_option.assert_called_once_with("mouse", "on")
+
+    def test_create_session_survives_mouse_option_failure(self, tmux, tmp_path):
+        """set_option runs after new_session but outside the rollback guard,
+        and libtmux raises on ANY set-option stderr -- if that propagated,
+        a scroll convenience would orphan a live session and block relaunch
+        under the same name. It must degrade to a warning instead."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        mock_session.set_option.side_effect = RuntimeError("unknown option: mouse")
+        tmux.server.new_session.return_value = mock_session
+
+        result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        assert result == "my-window"
+
+    def test_create_session_uses_explicit_dimensions(self, tmux, tmp_path):
+        """Guard against regressing the kiro-cli 2.1.x SIGWINCH-repaint bug (#216).
+
+        Default detached pane is 80x24. When the user attaches, tmux resizes
+        the pane to their real terminal size and kiro-cli 2.1.x fails to
+        repaint (blank screen, input silently dropped). Creating the pane at
+        220x50 makes the attach-time resize a no-op or shrink, which kiro
+        handles correctly.
+        """
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        kwargs = tmux.server.new_session.call_args.kwargs
+        assert kwargs.get("x") == 220
+        assert kwargs.get("y") == 50
+
+
+class TestCreateSessionEnvironmentFiltering:
+    """Tests for environment variable filtering in create_session (#242)."""
+
+    def _get_passed_environment(self, tmux, tmp_path, env_override):
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        with patch.dict(os.environ, env_override, clear=True):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+
+        return tmux.server.new_session.call_args.kwargs["environment"]
+
+    def test_essential_keys_always_passed(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "PATH": "/usr/bin" * 500,
+                "SHELL": "/bin/bash",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "en_US.UTF-8",
+                "LC_CTYPE": "UTF-8",
+            },
+        )
+        assert env["HOME"] == "/home/user"
+        assert env["PATH"] == "/usr/bin" * 500  # large PATH not dropped
+        assert env["LC_ALL"] == "en_US.UTF-8"
+        assert env["LC_CTYPE"] == "UTF-8"
+
+    def test_blocked_prefixes_filtered(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CLAUDE_SESSION_ID": "abc",
+                "CODEX_TOKEN": "secret",
+                "__MISE_WATCH": "long_data",
+            },
+        )
+        assert "CLAUDE_SESSION_ID" not in env
+        assert "CODEX_TOKEN" not in env
+        assert "__MISE_WATCH" not in env
+
+    def test_allowed_claude_auth_vars_pass_through(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_SKIP_FOUNDRY_AUTH": "1",
+            },
+        )
+        assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+        assert env["CLAUDE_CODE_SKIP_FOUNDRY_AUTH"] == "1"
+
+    def test_cao_kiro_mise_aws_prefixes_pass(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_TERMINAL_ID": "old",  # will be overwritten
+                "CAO_SERVER_PORT": "9889",
+                "KIRO_MODEL": "sonnet",
+                "MISE_ENV": "dev",
+                "AWS_PROFILE": "prod",
+                "AWS_REGION": "us-east-1",
+                "AWS_SESSION_TOKEN": "tok",
+            },
+        )
+        assert env["CAO_SERVER_PORT"] == "9889"
+        assert env["KIRO_MODEL"] == "sonnet"
+        assert env["MISE_ENV"] == "dev"
+        assert env["AWS_PROFILE"] == "prod"
+        assert env["AWS_SESSION_TOKEN"] == "tok"
+        # CAO_TERMINAL_ID is always overwritten
+        assert env["CAO_TERMINAL_ID"] == "tid1"
+
+    def test_histfile_points_at_dev_null_over_inherited_and_forwarded(self, tmux, tmp_path):
+        """The pane shell must not write agent launch commands to the user's history."""
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        with patch.dict(
+            os.environ, {"HOME": "/home/user", "HISTFILE": "/home/user/.bash_history"}, clear=True
+        ):
+            tmux.create_session(
+                "ses", "w", "tid1", str(tmp_path), extra_env={"HISTFILE": "/tmp/operator_hist"}
+            )
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        assert env["HISTFILE"] == "/dev/null"
+
+    def test_large_prefix_vars_dropped(self, tmux, tmp_path):
+        large_value = "x" * 2048  # exactly 2048 bytes, should be dropped (< 2048 fails)
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_BIG_VAR": large_value,
+            },
+        )
+        assert "CAO_BIG_VAR" not in env
+
+    def test_prefix_var_under_limit_passes(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_SMALL": "x" * 2047,
+            },
+        )
+        assert "CAO_SMALL" in env
+
+    def test_unrecognized_vars_excluded(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "RANDOM_VAR": "value",
+                "MY_CUSTOM_THING": "data",
+            },
+        )
+        assert "RANDOM_VAR" not in env
+        assert "MY_CUSTOM_THING" not in env
+
+
+# ── _set_server_history_limit (floor, #728) ──────────────────────────
+
+_READ_HISTORY_LIMIT = call("start-server", ";", "show-options", "-g", "history-limit")
+_SET_HISTORY_LIMIT = call(
+    "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+)
+
+
+def _server_reporting(history_limit, *, then=None):
+    """A ``server.cmd`` side effect whose ``show-options`` answers ``history_limit``.
+
+    ``history_limit`` may be an int (a live value), ``None`` (the read fails),
+    or a list of raw stdout lines. ``then`` supplies results for the calls that
+    follow the read, in order; the default is success.
+    """
+    following = list(then or [])
+
+    def cmd(*args):
+        if "show-options" in args:
+            if history_limit is None:
+                return MagicMock(returncode=1, stdout=[], stderr=["error connecting"])
+            if isinstance(history_limit, list):
+                return MagicMock(returncode=0, stdout=history_limit, stderr=[])
+            return MagicMock(returncode=0, stdout=[f"history-limit {history_limit}"], stderr=[])
+        if following:
+            return following.pop(0)
+        return MagicMock(returncode=0, stdout=[], stderr=[])
+
+    return cmd
+
+
+class TestSetServerHistoryLimit:
+    """CAO shares the operator's tmux server. The scrollback raise is a FLOOR:
+    a global at or above CAO's value is left alone, a lower one is raised, and
+    a value that cannot be read is never overwritten."""
+
+    def test_the_read_starts_the_server_in_the_same_invocation(self, tmux):
+        """So a clean socket reads the fresh server's value (2000, or whatever
+        the operator's .tmux.conf says) instead of failing, and the
+        ``set-option`` that follows cannot overwrite a dotfile value the read
+        never saw."""
+        tmux.server.cmd.side_effect = _server_reporting(2000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list[0] == _READ_HISTORY_LIMIT
+
+    def test_higher_existing_limit_is_left_alone(self, tmux):
+        """An operator-set 100000 must survive a CAO session launch untouched:
+        no ``set-option`` at all, not a set to the same value."""
+        tmux.server.cmd.side_effect = _server_reporting(100000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_limit_already_at_the_floor_is_left_alone(self, tmux):
+        tmux.server.cmd.side_effect = _server_reporting(TMUX_HISTORY_LIMIT)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_default_limit_is_raised_to_cao_floor(self, tmux):
+        """tmux's own 2000 default is below CAO's floor and gets raised."""
+        tmux.server.cmd.side_effect = _server_reporting(2000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT, _SET_HISTORY_LIMIT]
+
+    def test_an_operators_lower_limit_is_raised_too(self, tmux):
+        """This is a floor, not a preservation of whatever is there: an
+        operator who set 1000 gets CAO's value on this server. The override
+        for that operator is ``CAO_TMUX_HISTORY_LIMIT`` (docs/tmux.md)."""
+        tmux.server.cmd.side_effect = _server_reporting(1000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT, _SET_HISTORY_LIMIT]
+
+    def test_failed_read_sets_nothing(self, tmux):
+        """A live server whose value could not be read keeps it: a failed read
+        is not a licence to overwrite 100000 with 50000."""
+        tmux.server.cmd.side_effect = _server_reporting(None)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_unparseable_read_sets_nothing(self, tmux):
+        tmux.server.cmd.side_effect = _server_reporting(["history-limit lots", "noise"])
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_read_failure_as_exception_sets_nothing(self, tmux):
+        tmux.server.cmd.side_effect = OSError("tmux binary missing")
+
+        tmux._set_server_history_limit()  # best-effort: must not raise
+
+        assert tmux.server.cmd.call_count == 1
+
+    def test_set_is_retried_once_after_a_failed_set(self, tmux):
+        """Same single-retry contract as ``_set_server_exit_empty_off``, for the
+        same reason: a create right after an external ``kill-server`` can reach
+        the dying old server and get ``server exited unexpectedly``."""
+        tmux.server.cmd.side_effect = _server_reporting(
+            2000,
+            then=[
+                MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
+                MagicMock(returncode=0, stdout=[], stderr=[]),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
+            tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [
+            _READ_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+        ]
+        mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
+
+
+# ── create_window ────────────────────────────────────────────────────
+
+
+class TestCreateWindow:
+    def test_create_window_success(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = "agent-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
+
+        assert result == "agent-window"
+
+    def test_create_window_raises_the_shared_servers_history_limit(self, tmux, tmp_path):
+        """A window added to a session that predates this fix (or was created
+        by a different process) must still get the scrollback floor raised
+        before the window exists (#728)."""
+        mock_window = MagicMock()
+        mock_window.name = "agent-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+        tmux.server.cmd.side_effect = _server_reporting(2000)
+
+        tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
+
+        assert _SET_HISTORY_LIMIT in tmux.server.cmd.call_args_list
+
+    def test_create_window_sets_histfile_to_dev_null_over_forwarded(self, tmux, tmp_path):
+        """The window shell must not write agent launch commands to the user's history."""
+        mock_window = MagicMock()
+        mock_window.name = "agent-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.create_window(
+            "ses",
+            "agent-window",
+            "tid2",
+            str(tmp_path),
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+
+        env = mock_session.new_window.call_args.kwargs["environment"]
+        assert env["HISTFILE"] == "/dev/null"
+        assert env["CAO_TERMINAL_ID"] == "tid2"
+
+    def test_create_window_session_not_found(self, tmux, tmp_path):
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.create_window("nonexistent", "w", "tid2", str(tmp_path))
+
+    def test_create_window_name_none(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = None
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        with pytest.raises(ValueError, match="Window name is None"):
+            tmux.create_window("ses", "w", "tid2", str(tmp_path))
+
+    def test_create_window_with_window_shell(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = "restored-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.create_window(
+            "ses", "restored-window", "tid2", str(tmp_path), window_shell="cat /tmp/x; exec bash -l"
+        )
+
+        assert result == "restored-window"
+        call_kwargs = mock_session.new_window.call_args[1]
+        assert call_kwargs["window_shell"] == "cat /tmp/x; exec bash -l"
+
+
+# ── send_keys ────────────────────────────────────────────────────────
+
+
+class TestSendKeys:
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_success(self, mock_subprocess, mock_time, tmux):
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello", enter_count=1)
+
+        # copy-mode cancel, load-buffer, paste-buffer, pre-Enter cancel,
+        # send-keys Enter, delete-buffer
+        assert mock_subprocess.run.call_count == 6
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_multiple_enters(self, mock_subprocess, mock_time, tmux):
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello", enter_count=3)
+
+        # copy-mode cancel + load-buffer + paste-buffer
+        # + 3 x (pre-Enter cancel + send-keys Enter) + delete-buffer = 10
+        assert mock_subprocess.run.call_count == 10
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_cancels_copy_mode_before_paste(self, mock_subprocess, mock_time, tmux):
+        """A pane in copy mode consumes send-keys through the mode's key
+        table instead of delivering them to the application, so the
+        submitting Enter after paste-buffer is silently eaten (#654). The
+        cancel must come first, and must not check the exit code: on a pane
+        not in a mode the command fails with "not in a mode" by design."""
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello")
+
+        first = mock_subprocess.run.call_args_list[0]
+        assert first.args[0] == ["tmux", "send-keys", "-t", "ses:win", "-X", "cancel"]
+        assert first.kwargs.get("check") is False
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_cancels_copy_mode_before_each_enter(self, mock_subprocess, mock_time, tmux):
+        """The leading cancel alone is not enough: submit_delay is up to 2s
+        (claude_code's paste_submit_delay), and a wheel scroll inside that
+        window re-enters copy mode and eats the submitting Enter -- the
+        message sits typed but unsubmitted (#654). Every Enter must be
+        immediately preceded by its own cancel."""
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello", enter_count=2)
+
+        calls = mock_subprocess.run.call_args_list
+        cancel_argv = ["tmux", "send-keys", "-t", "ses:win", "-X", "cancel"]
+        enter_argv = ["tmux", "send-keys", "-t", "ses:win", "Enter"]
+        enter_indices = [i for i, c in enumerate(calls) if c.args[0] == enter_argv]
+        assert len(enter_indices) == 2
+        for i in enter_indices:
+            assert calls[i - 1].args[0] == cancel_argv
+            assert calls[i - 1].kwargs.get("check") is False
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_raises_on_failure(self, mock_subprocess, mock_time, tmux):
+        mock_subprocess.run.side_effect = Exception("tmux send failed")
+
+        with pytest.raises(Exception, match="tmux send failed"):
+            tmux.send_keys("ses", "win", "hello")
+
+
+# ── send_keys_via_paste ──────────────────────────────────────────────
+
+
+class TestSendKeysViaPaste:
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    def test_send_keys_via_paste_success(self, mock_time, tmux):
+        mock_pane = MagicMock()
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.send_keys_via_paste("ses", "win", "hello")
+
+        tmux.server.cmd.assert_any_call("set-buffer", "-b", "cao_paste", "hello")
+        # Copy-mode cancel (#654) must precede the paste, and again right
+        # before the submitting C-m -- a wheel scroll during the 0.3s
+        # post-paste sleep would re-enter copy mode and eat the submission.
+        assert mock_pane.cmd.call_args_list[0] == call("send-keys", "-X", "cancel")
+        assert mock_pane.cmd.call_args_list[1] == call("paste-buffer", "-p", "-b", "cao_paste")
+        assert mock_pane.cmd.call_args_list[2] == call("send-keys", "-X", "cancel")
+        mock_pane.send_keys.assert_called_once_with("C-m", enter=False)
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    def test_send_keys_via_paste_session_not_found(self, mock_time, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.send_keys_via_paste("nonexistent", "win", "hello")
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    def test_send_keys_via_paste_window_not_found(self, mock_time, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.send_keys_via_paste("ses", "nonexistent", "hello")
+
+
+# ── send_special_key ─────────────────────────────────────────────────
+
+
+class TestSendSpecialKey:
+    def test_send_special_key_success(self, tmux):
+        mock_pane = MagicMock()
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.send_special_key("ses", "win", "C-d")
+
+        # Copy-mode cancel (#654) must precede the key: a C-c/C-d sent into
+        # an active mode is consumed by the mode's key table.
+        mock_pane.cmd.assert_called_once_with("send-keys", "-X", "cancel")
+        mock_pane.send_keys.assert_called_once_with("C-d", enter=False)
+
+    def test_send_special_key_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.send_special_key("nonexistent", "win", "C-d")
+
+    def test_send_special_key_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.send_special_key("ses", "nonexistent", "C-d")
+
+
+# ── get_history ──────────────────────────────────────────────────────
+
+
+class TestGetHistory:
+    def test_get_history_success(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line1", "line2", "line3"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_history("ses", "win")
+
+        assert result == "line1\nline2\nline3"
+
+    def test_get_history_empty_output(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = []
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_history("ses", "win")
+
+        assert result == ""
+
+    def test_get_history_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.get_history("nonexistent", "win")
+
+    def test_get_history_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.get_history("ses", "nonexistent")
+
+    def test_get_history_custom_tail_lines(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.get_history("ses", "win", tail_lines=50)
+
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-e", "-p", "-S", "-50")
+
+    def test_get_history_full_history(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line1", "line2"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_history("ses", "win", strip_escapes=True, full_history=True)
+
+        assert result == "line1\nline2"
+        # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
+
+    def test_get_history_join_wrapped_asks_tmux_to_rejoin_soft_wraps(self, tmux):
+        """-J: a one-line message a program printed comes back as ONE row at any
+        pane width, instead of split at the exact column (#967)."""
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.get_history("ses", "win", tail_lines=50, join_wrapped=True)
+
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-e", "-J", "-p", "-S", "-50")
+
+    def test_get_history_default_does_not_rejoin_soft_wraps(self, tmux):
+        """Every other caller parses the RENDERED rows; -J is opt-in."""
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.get_history("ses", "win", tail_lines=50)
+
+        assert "-J" not in mock_pane.cmd.call_args.args
+
+
+# ── list_sessions ────────────────────────────────────────────────────
+
+
+class TestListSessions:
+    def test_list_sessions_success(self, tmux):
+        mock_session = MagicMock()
+        mock_session.name = "cao-test"
+        mock_session.attached_sessions = []
+        tmux.server.sessions = [mock_session]
+
+        result = tmux.list_sessions()
+
+        assert len(result) == 1
+        assert result[0]["name"] == "cao-test"
+        assert result[0]["status"] == "detached"
+
+    def test_list_sessions_attached(self, tmux):
+        mock_session = MagicMock()
+        mock_session.name = "cao-test"
+        mock_session.attached_sessions = [MagicMock()]
+        tmux.server.sessions = [mock_session]
+
+        result = tmux.list_sessions()
+
+        assert result[0]["status"] == "active"
+
+    def test_list_sessions_returns_empty_on_error(self, tmux):
+        tmux.server.sessions = MagicMock(side_effect=Exception("no server"))
+        tmux.server.sessions.__iter__ = MagicMock(side_effect=Exception("no server"))
+
+        result = tmux.list_sessions()
+
+        assert result == []
+
+
+# ── get_session_windows ──────────────────────────────────────────────
+
+
+class TestGetSessionWindows:
+    def test_get_session_windows_success(self, tmux):
+        mock_window = MagicMock()
+        mock_window.name = "agent-win"
+        mock_window.index = 0
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_session_windows("ses")
+
+        assert len(result) == 1
+        assert result[0]["name"] == "agent-win"
+
+    def test_get_session_windows_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.get_session_windows("nonexistent")
+
+        assert result == []
+
+    def test_get_session_windows_error(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.get_session_windows("ses")
+
+        assert result == []
+
+
+# ── kill_session ─────────────────────────────────────────────────────
+
+
+def _cmd_result(returncode, stdout=(), stderr=()):
+    """Build a stand-in for libtmux's ``tmux_cmd`` result object.
+
+    ``session_exists_strict`` reads exactly three attributes off it, so this is
+    the whole surface. Used to drive the verify poll, which now runs its own
+    ``list-sessions`` instead of touching ``server.sessions`` (#498).
+    """
+    result = MagicMock()
+    result.returncode = returncode
+    result.stdout = list(stdout)
+    result.stderr = list(stderr)
+    return result
+
+
+class TestKillSession:
+    def test_kill_session_success(self, tmux):
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # The strict verify runs list-sessions: exit 0 with "cao-ses" absent from the
+        # name list is an authoritative "gone" (#498).
+        tmux.server.cmd.return_value = _cmd_result(0, stdout=["other"])
+
+        result = tmux.kill_session("cao-ses")
+
+        assert result is True
+        mock_session.kill.assert_called_once()
+
+    def test_kill_session_polls_until_session_confirmed_gone(self, tmux, monkeypatch):
+        """The BOUNDED RETRY loop is what makes True mean "confirmed gone".
+
+        tmux does not always reap a session synchronously with ``session.kill()``,
+        so the primitive polls. Here the session is still listed on the first
+        verify and only absent on the second: kill_session must keep polling and
+        return True, having slept between attempts. Only immediate-success and
+        the timeout=0 path were covered before, leaving the retry loop — the
+        whole point of the confirmation contract — unexercised (#498).
+        """
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # First the browser-view lookup (none open). Then the 1st verify: still
+        # listed -> must sleep and retry. 2nd: gone -> True.
+        tmux.server.cmd.side_effect = [
+            _cmd_result(0, stdout=[]),
+            _cmd_result(0, stdout=["cao-ses"]),
+            _cmd_result(0, stdout=[]),
+        ]
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.tmux.time.sleep", lambda s: sleeps.append(s)
+        )
+
+        result = tmux.kill_session("cao-ses")
+
+        assert result is True
+        mock_session.kill.assert_called_once()
+        # Exactly one retry: it slept once, between the alive verify and the
+        # one that confirmed absence.
+        assert sleeps == [tmux._KILL_SESSION_VERIFY_INTERVAL_SECONDS]
+        assert tmux.server.cmd.call_count == 3
+
+    def test_kill_session_lookup_error_during_verify_is_not_gone(self, tmux, monkeypatch):
+        """A transient lookup error during the verification poll must NOT be
+        read as "session gone": kill_session returns False, never a false True
+        (#498)."""
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # Found on the initial lookup; the verify's list-sessions then fails in a
+        # way that is NOT an absence (permission denied), so the strict check
+        # raises TmuxLookupError, which must be caught as a failed kill.
+        tmux.server.cmd.return_value = _cmd_result(
+            1, stderr=["error connecting to /tmp/x.sock (Permission denied)"]
+        )
+        monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
+
+        result = tmux.kill_session("cao-ses")
+
+        assert result is False
+        mock_session.kill.assert_called_once()
+
+    def test_kill_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.kill_session("cao-nonexistent")
+
+        assert result is False
+
+    def test_kill_session_error(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.kill_session("cao-ses")
+
+        assert result is False
+
+    def test_kill_session_returns_false_when_session_survives(self, tmux, monkeypatch):
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # Every verify authoritatively still lists the session, so the bounded
+        # poll expires without confirmation.
+        tmux.server.cmd.return_value = _cmd_result(0, stdout=["cao-ses"])
+        monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
+
+        result = tmux.kill_session("cao-ses")
+
+        assert result is False
+        mock_session.kill.assert_called_once()
+
+
+# ── kill_window ──────────────────────────────────────────────────────
+
+
+class TestKillWindow:
+    def test_kill_window_success(self, tmux):
+        mock_window = MagicMock()
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.kill_window("cao-ses", "win")
+
+        assert result is True
+        mock_window.kill.assert_called_once()
+
+    def test_kill_window_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.kill_window("cao-ses", "win")
+
+        assert result is False
+
+    def test_kill_window_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.kill_window("cao-ses", "cao-nonexistent")
+
+        assert result is False
+
+    def test_kill_window_error(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.kill_window("cao-ses", "win")
+
+        assert result is False
+
+
+# ── session_exists ───────────────────────────────────────────────────
+
+
+class TestSessionExists:
+    def test_session_exists_true(self, tmux):
+        tmux.server.sessions.get.return_value = MagicMock()
+
+        assert tmux.session_exists("ses") is True
+
+    def test_session_exists_false(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        assert tmux.session_exists("ses") is False
+
+    def test_session_exists_error(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        assert tmux.session_exists("ses") is False
+
+
+# ── get_pane_working_directory ───────────────────────────────────────
+
+
+class TestGetPaneWorkingDirectory:
+    def test_get_pane_working_directory_success(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["/home/user/project"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_working_directory("ses", "win")
+
+        assert result == "/home/user/project"
+
+    def test_get_pane_working_directory_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.get_pane_working_directory("ses", "win")
+
+        assert result is None
+
+    def test_get_pane_working_directory_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_working_directory("ses", "win")
+
+        assert result is None
+
+    def test_get_pane_working_directory_error(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.get_pane_working_directory("ses", "win")
+
+        assert result is None
+
+
+# ── pipe_pane / stop_pipe_pane ───────────────────────────────────────
+
+
+class TestPipePane:
+    def test_pipe_pane_success(self, tmux):
+        mock_pane = MagicMock()
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.pipe_pane("ses", "win", "/tmp/log.txt")
+
+        # Our FIFO writer, not `cat >> path`: cat follows a symlink and appends
+        # to a regular file swapped in at the FIFO path; the writer refuses both.
+        import shlex
+        import sys
+
+        from cli_agent_orchestrator.utils import fifo_writer
+
+        mock_pane.cmd.assert_called_once_with(
+            "pipe-pane",
+            "-o",
+            f"{shlex.quote(sys.executable)} -I -S {shlex.quote(fifo_writer.__file__)} /tmp/log.txt",
+        )
+
+    def test_pipe_pane_command_quotes_the_fifo_path(self, tmux):
+        """The path rides through `sh -c`; a space or quote in it must not split the command."""
+        import shlex
+
+        command = tmux._pipe_pane_command("/tmp/odd dir/it's.fifo")
+        assert command.endswith(" " + shlex.quote("/tmp/odd dir/it's.fifo"))
+        assert shlex.split(command)[-1] == "/tmp/odd dir/it's.fifo"
+
+    def test_pipe_pane_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.pipe_pane("nonexistent", "win", "/tmp/log.txt")
+
+    def test_pipe_pane_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.pipe_pane("ses", "nonexistent", "/tmp/log.txt")
+
+
+class TestStopPipePane:
+    def test_stop_pipe_pane_success(self, tmux):
+        mock_pane = MagicMock()
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.stop_pipe_pane("ses", "win")
+
+        mock_pane.cmd.assert_called_once_with("pipe-pane")
+
+    def test_stop_pipe_pane_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.stop_pipe_pane("nonexistent", "win")
+
+    def test_stop_pipe_pane_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        with pytest.raises(ValueError, match="not found"):
+            tmux.stop_pipe_pane("ses", "nonexistent")
+
+
+class TestGetPaneCurrentCommand:
+    @staticmethod
+    def _pane_reports(tmux, line):
+        mock_session = MagicMock()
+        mock_window = MagicMock()
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value.stdout = [line]
+        mock_window.active_pane = mock_pane
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+        return mock_pane
+
+    def test_get_pane_current_command_success(self, tmux):
+        mock_pane = self._pane_reports(tmux, "node\t4242")
+
+        with patch("cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy") as inside:
+            result = tmux.get_pane_current_command("ses", "win")
+
+        assert result == "node"
+        mock_pane.cmd.assert_called_once_with(
+            "display-message", "-p", "#{pane_current_command}\t#{pane_pid}"
+        )
+        inside.assert_not_called()
+
+    def test_shell_outside_a_proxy_keeps_the_tmux_name(self, tmux):
+        self._pane_reports(tmux, "bash\t4242")
+
+        with patch(
+            "cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy", return_value=None
+        ) as inside:
+            result = tmux.get_pane_current_command("ses", "win")
+
+        assert result == "bash"
+        inside.assert_called_once_with(4242)
+
+    def test_shell_that_is_a_pty_proxy_reports_the_inner_program(self, tmux):
+        """Kiro CLI's shell integration makes the pane process ``zsh
+        (kiro-cli-term)``, so tmux reports ``zsh`` while kiro-cli runs inside."""
+        self._pane_reports(tmux, "zsh\t4242")
+
+        with patch(
+            "cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy",
+            return_value="kiro-cli",
+        ):
+            assert tmux.get_pane_current_command("ses", "win") == "kiro-cli"
+
+    def test_shell_without_a_pane_pid_keeps_the_tmux_name(self, tmux):
+        self._pane_reports(tmux, "zsh")
+
+        with patch("cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy") as inside:
+            assert tmux.get_pane_current_command("ses", "win") == "zsh"
+
+        inside.assert_not_called()
+
+    def test_get_pane_current_command_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.get_pane_current_command("nonexistent", "win")
+
+        assert result is None
+
+    def test_get_pane_current_command_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_current_command("ses", "nonexistent")
+
+        assert result is None
+
+    def test_get_pane_current_command_exception_returns_none(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.get_pane_current_command("ses", "win")
+
+        assert result is None
+
+
+def _fake_process(pid, name, session, started, parent, group=None):
+    process = MagicMock()
+    process.pid = pid
+    process.session = session
+    process.group = pid if group is None else group
+    process.name.return_value = name
+    process.create_time.return_value = started
+    process.ppid.return_value = parent
+    return process
+
+
+class TestCommandInsidePtyProxy:
+    """The process tree under the pane process, read with psutil."""
+
+    def _inside(self, pane_pid, processes, foreground=None):
+        from cli_agent_orchestrator.clients.tmux import _command_inside_pty_proxy
+
+        by_pid = {p.pid: p for p in processes}
+        pane = MagicMock()
+        pane.children.return_value = [p for p in processes if p.pid != pane_pid]
+        sessions = {p.pid: p.session for p in processes}
+        groups = {p.pid: p.group for p in processes}
+        assert pane_pid in by_pid
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.psutil.Process", return_value=pane),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.os.getsid", side_effect=sessions.__getitem__
+            ),
+            patch("cli_agent_orchestrator.clients.tmux.os.getpgid", side_effect=groups.__getitem__),
+            patch(
+                "cli_agent_orchestrator.clients.tmux._foreground_process_group",
+                return_value=foreground,
+            ),
+        ):
+            return _command_inside_pty_proxy(pane_pid)
+
+    def test_a_shell_and_its_program_in_one_session_are_not_a_proxy(self):
+        shell = _fake_process(10, "zsh", 10, 1.0, 1)
+        program = _fake_process(11, "vim", 10, 2.0, 10)
+
+        assert self._inside(10, [shell, program], foreground=11) is None
+
+    def test_the_foreground_program_of_the_inner_shell_is_reported(self):
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        program = _fake_process(12, "kiro-cli", 11, 3.0, 11)
+
+        assert self._inside(10, [proxy, shell, program], foreground=12) == "kiro-cli"
+
+    def test_an_inner_shell_at_its_prompt_reports_the_shell(self):
+        """A background child of the shell, such as p10k's gitstatusd, is not
+        the program in the foreground."""
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        helper = _fake_process(12, "gitstatusd", 11, 3.0, 11)
+
+        assert self._inside(10, [proxy, shell, helper], foreground=11) == "zsh"
+
+    def test_unknown_foreground_group_reports_the_newest_job(self):
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        older = _fake_process(12, "sleep", 11, 3.0, 11)
+        newer = _fake_process(13, "codex", 11, 4.0, 11)
+
+        assert self._inside(10, [proxy, shell, older, newer], foreground=None) == "codex"
+
+    def test_a_child_in_another_session_that_is_not_a_shell_is_not_a_proxy(self):
+        """A daemon that the pane's shell started with setsid."""
+        shell = _fake_process(10, "zsh", 10, 1.0, 1)
+        daemon = _fake_process(11, "gitstatusd", 11, 2.0, 10)
+
+        assert self._inside(10, [shell, daemon], foreground=10) is None
+
+    def test_a_process_that_exits_during_the_scan_is_skipped(self):
+        import psutil
+
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        gone = _fake_process(12, "sh", 11, 3.0, 11)
+        gone.ppid.side_effect = psutil.NoSuchProcess(12)
+        program = _fake_process(13, "codex", 11, 4.0, 11)
+
+        assert self._inside(10, [proxy, shell, gone, program], foreground=13) == "codex"
+
+    def test_an_unreadable_process_table_returns_none(self):
+        import psutil
+
+        from cli_agent_orchestrator.clients.tmux import _command_inside_pty_proxy
+
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.psutil.Process",
+            side_effect=psutil.NoSuchProcess(4242),
+        ):
+            assert _command_inside_pty_proxy(4242) is None
+
+    @staticmethod
+    def _run_real_proxy(inner_command):
+        """A process that forks a shell onto a new pty is a proxy, as
+        kiro-cli-term is. Return what the look-through reports for it."""
+        import sys
+        import time
+
+        import psutil
+
+        from cli_agent_orchestrator.clients.tmux import _command_inside_pty_proxy
+
+        proxy = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, pty, sys\n"
+                "pid, fd = pty.fork()\n"
+                "if pid == 0:\n"
+                "    os.execvp('sh', ['sh', '-c', sys.argv[1]])\n"
+                "os.waitpid(pid, 0)\n",
+                inner_command,
+            ],
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            names = []
+            while time.monotonic() < deadline:
+                name = _command_inside_pty_proxy(proxy.pid)
+                if name not in (None, "python3", "python"):
+                    names.append(name)
+                    if len(names) >= 3 and names[-1] == names[-2] == names[-3]:
+                        return name
+                time.sleep(0.2)
+            return names[-1] if names else None
+        finally:
+            try:
+                for child in psutil.Process(proxy.pid).children(recursive=True):
+                    child.kill()
+            except psutil.Error:
+                pass
+            proxy.kill()
+            proxy.wait(timeout=10)
+
+    def test_a_real_pty_proxy_reports_the_foreground_job(self):
+        # "set -m" turns on job control, as in the interactive shell of a pane.
+        assert self._run_real_proxy("set -m; sleep 30; :") == "sleep"
+
+    def test_a_real_pty_proxy_with_a_background_job_reports_the_shell(self):
+        from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
+        # /bin/sh is dash on Debian and bash on macOS.
+        assert self._run_real_proxy("set -m; sleep 30 & wait") in (
+            BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+        )
+
+
+class TestPaneIsBracketedPasteIncompatible:
+    @pytest.mark.parametrize(
+        "shell", ["sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"]
+    )
+    def test_every_known_shell_is_incompatible(self, tmux, shell):
+        with patch.object(tmux, "get_pane_current_command", return_value=shell):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is True
+
+    @pytest.mark.parametrize("program", ["node", "claude", "kiro-cli", "python3", "codex"])
+    def test_known_tui_programs_are_compatible(self, tmux, program):
+        with patch.object(tmux, "get_pane_current_command", return_value=program):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False
+
+    def test_lookup_failure_is_treated_as_compatible(self, tmux):
+        """Fails closed to the existing (pre-fix) behavior on an
+        unresolvable pane command -- see send_keys' own docstring."""
+        with patch.object(tmux, "get_pane_current_command", return_value=None):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False
+
+
+# ── real-tmux regression guard for the exit-empty gap (PR #599) ────────
+#
+# Every test above mocks libtmux.Server entirely, which is exactly why
+# haofeif's P2 finding (harness-control#845 follow-up) shipped unnoticed:
+# the mock-based TestCreateSession tests only prove ``server.cmd(...)`` was
+# CALLED with the right arguments, never that a real tmux server actually
+# ends up with ``exit-empty off`` in force. The bug was a genuine tmux/
+# libtmux interaction (a clean-server ``set-option`` failing to connect,
+# silently, because libtmux 0.51's ``Server.cmd()`` returns rather than
+# raises) that no amount of mock-call assertions could catch. This class
+# exercises the REAL ``TmuxClient`` against a REAL, isolated tmux server —
+# the same way the reviewer reproduced the finding — and is the guard that
+# would have failed on the pre-fix code.
+
+
+@pytest.mark.integration
+class TestRealTmuxExitEmpty:
+    """Drives the real tmux client end-to-end on an isolated socket.
+
+    Marked ``integration`` (not ``e2e``): this repo's default ``pytest``
+    invocation only excludes ``e2e`` (``pyproject.toml`` ``addopts``, and
+    CI's "Unit Tests" job), so an ``integration``-marked test still runs in
+    CI/build-and-test; the documented fast inner dev loop explicitly adds
+    ``-m 'not integration'`` on top (DEVELOPMENT.md) to skip it. tmux itself
+    is a project prerequisite, not an optional provider CLI (DEVELOPMENT.md:
+    "tmux 3.2+ (for running the orchestrator and integration tests)"), so
+    this is the correct tier — lighter than ``e2e`` (no CAO server, no
+    provider CLI, no auth), but still a real subprocess/real-tmux test that
+    the fast unit loop is allowed to skip.
+
+    Each test gets its own uniquely-named tmux socket (no shared state with
+    any other test, this repo's dev tmux server, or a parallel xdist worker)
+    and the socket's server is killed in a ``finally`` regardless of outcome.
+    """
+
+    def _require_tmux(self) -> None:
+        if not shutil.which("tmux"):
+            pytest.skip("tmux not installed")
+
+    def _show_exit_empty(self, socket_name: str) -> str:
+        """Read exit-empty via a bare ``tmux`` CLI call — deliberately NOT
+        through libtmux/TmuxClient, so this assertion does not share any code
+        path with the thing under test."""
+        result = subprocess.run(
+            ["tmux", "-L", socket_name, "show-options", "-s", "exit-empty"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"'tmux show-options' failed unexpectedly: {result.stderr}"
+        return result.stdout.strip()
+
+    def test_exit_empty_off_after_first_create_session_on_clean_server(self, tmp_path):
+        """The reviewer-reported P2, reproduced and guarded directly: on a
+        CLEAN server (no prior sessions), 'exit-empty' must already read
+        'off' after the very FIRST ``create_session()`` call — not only
+        after a second one. Pre-fix, this assertion fails: the first call
+        left the option at the tmux default 'on'.
+        """
+        self._require_tmux()
+
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        socket_name = f"cao-test-exit-empty-{uuid.uuid4().hex[:12]}"
+        subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_name=socket_name)
+
+        try:
+            window_name = client.create_session(
+                "exit-empty-probe", "win1", "term-real-tmux-1", str(tmp_path)
+            )
+            assert window_name == "win1"
+
+            assert self._show_exit_empty(socket_name) == "exit-empty off", (
+                "exit-empty must be 'off' after the FIRST create_session() on a "
+                "clean server (harness-control#845 / PR #599 review finding)"
+            )
+        finally:
+            subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+    def test_exit_empty_off_survives_external_server_restart(self, tmp_path):
+        """The same gap reopens after an externally-restarted server (a
+        crash, an admin ``kill-server``, ...): the reviewer noted this
+        lifecycle is "still exposed to the teardown/create race this PR is
+        meant to close" for exactly this reason. Simulate it directly:
+        create a session, kill the server out from under the client, then
+        create another session on the same socket and assert the option is
+        back in force after that first post-restart create_session().
+        """
+        self._require_tmux()
+
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        socket_name = f"cao-test-exit-empty-restart-{uuid.uuid4().hex[:12]}"
+        subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_name=socket_name)
+
+        try:
+            client.create_session("restart-probe-1", "win1", "term-real-tmux-2", str(tmp_path))
+            assert self._show_exit_empty(socket_name) == "exit-empty off"
+
+            # Simulate an external restart (crash / admin action): the whole
+            # server process goes away, socket included.
+            subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+            client.create_session("restart-probe-2", "win2", "term-real-tmux-3", str(tmp_path))
+            assert self._show_exit_empty(socket_name) == "exit-empty off", (
+                "exit-empty must be back 'off' after the first create_session() "
+                "following an external server restart on the same socket"
+            )
+        finally:
+            subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+    def test_exit_empty_off_when_the_first_set_reaches_a_dying_server(self):
+        """``tmux kill-server`` returns before the old server has exited, so
+        the create that follows can connect to it just as it goes away. tmux
+        prints ``server exited unexpectedly`` and the option is never set.
+        The test above hits that window about once in 60 runs under load.
+
+        Here the dying server is a stand-in listening on the socket path: it
+        accepts one connection, closes it and removes the socket, which is
+        exactly what a real tmux client sees from a server mid-exit.
+        """
+        self._require_tmux()
+
+        import socket
+        import tempfile
+        import threading
+
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        # Short directory: tmp_path can exceed the ~108-byte AF_UNIX path limit.
+        socket_dir = tempfile.mkdtemp(prefix="cao-tmux-")
+        socket_path = os.path.join(socket_dir, "s")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(socket_path)
+        listener.listen(1)
+
+        def die_on_first_connect() -> None:
+            conn, _ = listener.accept()
+            conn.close()
+            listener.close()
+            os.unlink(socket_path)
+
+        dying = threading.Thread(target=die_on_first_connect, daemon=True)
+        dying.start()
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_path=socket_path)
+
+        try:
+            client.create_session("dying-probe", "win1", "term-real-tmux-4", socket_dir)
+            dying.join(timeout=5)
+            assert not dying.is_alive(), "the stand-in server was never contacted"
+
+            result = subprocess.run(
+                ["tmux", "-S", socket_path, "show-options", "-s", "exit-empty"],
+                capture_output=True,
+                text=True,
+            )
+            assert result.stdout.strip() == "exit-empty off", (
+                "exit-empty must be 'off' even when the first set reached a server "
+                f"that was exiting; tmux said {result.stdout.strip()!r} {result.stderr!r}"
+            )
+        finally:
+            subprocess.run(["tmux", "-S", socket_path, "kill-server"], capture_output=True)
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+class TestRealTmuxHistoryLimit:
+    """A CAO pane must keep enough scrollback to hold a worker's whole reply (#728).
+
+    Real tmux, isolated socket, same tier and lifecycle discipline as
+    ``TestRealTmuxExitEmpty`` above — and for the same reason: the bug being
+    guarded is a tmux-behaviour bug (the default 2000-line scrollback is
+    shallower than the extraction ladder reaches), which no mock-call
+    assertion can observe.
+
+    Every server here starts from ``-f /dev/null``. Without that, tmux sources
+    the developer's own ``~/.tmux.conf`` into the "isolated" server, and a
+    dotfile that already says ``history-limit 50000`` (the repo's recommended
+    one does) makes every assertion below pass against the merge base. The
+    tests that model a pre-existing session also assert the 2000 precondition
+    outright, so a vacuous pass is a failure, not a green.
+
+    One test per pane-creating path in ``TmuxClient``: the first pane of a new
+    session, a window added to an existing session, a split into an existing
+    host window, and the host window a pane-mode terminal opens when none
+    exists. Each path has to raise the floor itself, because the session it
+    runs against may never have had it raised (made before this fix, or by
+    another process), and lines a pane has already discarded at 2000 do not
+    come back when the option is raised later.
+
+    tmux versions. Every assertion about a pane CAO creates holds on every
+    tmux this project supports (3.2+; CI runs Ubuntu 24.04's 3.4, developers
+    tend to run 3.8). What happens to a pane that ALREADY existed when CAO
+    raised the global changed in tmux 3.7 ("When history-limit is changed,
+    apply to existing panes, not just new ones", CHANGES, issue 4705): before
+    3.7 that pane reports the 2000 it was created with for the rest of its
+    life; from 3.7 it reports the raised value and keeps later output to it.
+    The one test that has a pre-existing pane in view branches on that, with
+    both arms asserted, so a future tmux that changes it again fails here
+    instead of passing by accident.
+    """
+
+    # The release that made a raised history-limit apply to existing panes.
+    _EXISTING_PANES_FOLLOW_GLOBAL_SINCE = (3, 7)
+
+    @staticmethod
+    def _tmux_version() -> tuple[int, int]:
+        out = subprocess.run(["tmux", "-V"], capture_output=True, text=True, check=True).stdout
+        match = re.search(r"(\d+)\.(\d+)", out)
+        assert match, f"could not parse tmux version from {out!r}"
+        return int(match.group(1)), int(match.group(2))
+
+    def _require_tmux(self) -> None:
+        if not shutil.which("tmux"):
+            pytest.skip("tmux not installed")
+
+    @staticmethod
+    def _tmux(socket_name: str, *args: str) -> subprocess.CompletedProcess:
+        """A bare tmux call against the isolated server, outside the code under test."""
+        return subprocess.run(
+            ["tmux", "-L", socket_name, "-f", "/dev/null", *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def _pane_limits(self, socket_name: str, target: str) -> list[int]:
+        """``history_limit`` of every pane in ``target``, as tmux reports it."""
+        return sorted(self._pane_limits_by_id(socket_name, target).values())
+
+    def _pane_limits_by_id(self, socket_name: str, target: str) -> dict[str, int]:
+        """``history_limit`` of every pane in ``target``, keyed by pane id."""
+        result = self._tmux(
+            socket_name, "list-panes", "-t", target, "-F", "#{pane_id} #{history_limit}"
+        )
+        assert result.returncode == 0, f"tmux list-panes failed: {result.stderr}"
+        return {
+            pane_id: int(limit)
+            for pane_id, limit in (line.split() for line in result.stdout.split("\n") if line)
+        }
+
+    def _global_limit(self, socket_name: str) -> int:
+        result = self._tmux(socket_name, "show-options", "-gv", "history-limit")
+        assert result.returncode == 0, f"tmux show-options failed: {result.stderr}"
+        return int(result.stdout.strip())
+
+    def _client(self, socket_name: str, pane_mode: bool = False):
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        client = TmuxClient(pane_mode=pane_mode)
+        # ``config_file`` puts ``-f /dev/null`` on every libtmux invocation
+        # too, including the ``start-server`` the client itself issues.
+        client.server = libtmux.Server(socket_name=socket_name, config_file="/dev/null")
+        return client
+
+    def _pre_existing_session(self, socket_name: str, session: str, window: str, cwd: str) -> None:
+        """A session created by something other than this TmuxClient, at tmux's defaults.
+
+        Models a session that predates the fix or that another process made:
+        its global ``history-limit`` is still 2000, so whichever creation path
+        runs next must raise it, or its pane starts life at 2000.
+        """
+        made = self._tmux(socket_name, "new-session", "-d", "-s", session, "-n", window, "-c", cwd)
+        assert made.returncode == 0, f"could not create the probe session: {made.stderr}"
+        assert self._global_limit(socket_name) == 2000, (
+            "precondition: the isolated server must start at tmux's 2000 default, or "
+            "nothing below proves the raise happened"
+        )
+        assert self._pane_limits(socket_name, f"{session}:{window}") == [2000]
+
+    def test_first_pane_of_a_new_session_keeps_the_configured_scrollback(self, tmp_path):
+        """The session's FIRST window is an agent terminal, and a pane reads
+        history-limit only at creation time. Pre-fix this reads tmux's default
+        2000 — shallower than ``_ESCALATION_STEPS[-1]`` (5000), so the deepest
+        extraction rung could not reach further than the middle rungs and a
+        long reply was silently lost from scrollback (#728).
+
+        Holds on every supported tmux (3.2+): only a pane CAO created is in view.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-limit-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        client = self._client(socket_name)
+        try:
+            client.create_session("history-probe", "win1", "term-hist-1", str(tmp_path))
+
+            assert self._pane_limits(socket_name, "history-probe:win1") == [TMUX_HISTORY_LIMIT], (
+                "the first pane of a CAO session must keep CAO's configured "
+                "scrollback, not tmux's 2000-line default"
+            )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_a_window_added_to_a_pre_existing_session_gets_the_floor(self, tmp_path):
+        """``create_window`` is how every assign/handoff worker terminal is made.
+        On a session whose global is still 2000 (asserted first), the new
+        window must get the floor (#728).
+
+        Holds on every supported tmux (3.2+): only the new window's pane is
+        asserted after the raise. The pre-existing window's pane is not, since
+        what it reports is version-dependent (class docstring).
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-window-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        try:
+            self._pre_existing_session(socket_name, "pre", "win1", str(tmp_path))
+            client = self._client(socket_name)
+
+            client.create_window("pre", "win2", "term-hist-2", str(tmp_path))
+
+            assert self._pane_limits(socket_name, "pre:win2") == [TMUX_HISTORY_LIMIT], (
+                "a worker window added to a pre-existing session must get CAO's "
+                "scrollback floor; it inherited the stale global instead"
+            )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_a_split_into_a_pre_existing_host_window_gets_the_floor(self, tmp_path):
+        """Pane mode's ``_split_host_window`` path: the host window already
+        exists (made at 2000 by someone else, asserted first), and the split
+        must not start life at that (#728).
+
+        The NEW pane's assertion holds on every supported tmux. The host
+        window's ORIGINAL pane is the one place this class has a pre-existing
+        pane in view, and what it reports depends on the tmux version (see the
+        class docstring): 2000 before 3.7, the raised value from 3.7. Both arms
+        are asserted; CI's 3.4 and a developer's 3.8 take different ones.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-split-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        try:
+            self._pre_existing_session(socket_name, "pre", "cao-agents", str(tmp_path))
+            before = self._pane_limits_by_id(socket_name, "pre:cao-agents")
+            assert len(before) == 1
+            (original_id,) = before
+            client = self._client(socket_name, pane_mode=True)
+
+            client.create_pane("pre", "cao-agents", "coder-1", "term-hist-3", str(tmp_path))
+
+            after = self._pane_limits_by_id(socket_name, "pre:cao-agents")
+            new_ids = set(after) - {original_id}
+            assert (
+                len(new_ids) == 1
+            ), f"expected exactly one split pane, panes went {before} -> {after}"
+            (new_id,) = new_ids
+            assert after[new_id] == TMUX_HISTORY_LIMIT, (
+                "the split pane must get CAO's scrollback floor; the window was at "
+                f"2000 before create_pane ran and the new pane reports {after[new_id]}"
+            )
+
+            if self._tmux_version() >= self._EXISTING_PANES_FOLLOW_GLOBAL_SINCE:
+                assert after[original_id] == TMUX_HISTORY_LIMIT, (
+                    "tmux >= 3.7 applies a raised history-limit to existing panes "
+                    f"(CHANGES, issue 4705); the original pane reports {after[original_id]}"
+                )
+            else:
+                assert after[original_id] == 2000, (
+                    "tmux < 3.7 leaves an existing pane at the limit it was created "
+                    f"with; the original pane reports {after[original_id]}"
+                )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_the_host_window_opened_by_the_first_pane_mode_terminal_gets_the_floor(self, tmp_path):
+        """Pane mode's ``_open_host_window`` path: no host window yet, so the
+        first pane-mode terminal opens it and takes its first pane. That pane
+        is an agent terminal too (#728).
+
+        Holds on every supported tmux (3.2+): only the new window's pane is
+        asserted.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-host-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        try:
+            self._pre_existing_session(socket_name, "pre", "win1", str(tmp_path))
+            client = self._client(socket_name, pane_mode=True)
+
+            client.create_pane("pre", "cao-agents", "coder-1", "term-hist-4", str(tmp_path))
+
+            assert self._pane_limits(socket_name, "pre:cao-agents") == [TMUX_HISTORY_LIMIT], (
+                "the host window a pane-mode terminal opens must get CAO's "
+                "scrollback floor; it inherited the stale global instead"
+            )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_deep_capture_rungs_actually_reach_deeper_than_shallow_ones(self, tmp_path):
+        """The ladder must be monotonic on real tmux: with the default 2000-line
+        limit, ``-S -5000`` and ``-S -`` both return ~2004 lines on a pane that
+        printed 3000 (measured, tmux 3.2a) and the earliest ~1000 lines are
+        gone. With CAO's limit in force the deepest rung sees all of them.
+
+        Holds on every supported tmux (3.2+): the pane is created by CAO after
+        the raise, so its limit does not depend on the 3.7 change.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-depth-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        client = self._client(socket_name)
+        try:
+            client.create_session("depth-probe", "win1", "term-hist-5", str(tmp_path))
+            # Drive the pane through a bare ``tmux send-keys``, not through
+            # TmuxClient's paste-buffer path: this test is about capture depth,
+            # and the send path has its own version-dependent behaviour (3.2a
+            # rejects ``paste-buffer -p``) that would turn an unrelated
+            # incompatibility into a failure of this assertion.
+            fill = self._tmux(
+                socket_name,
+                "send-keys",
+                "-t",
+                "depth-probe:win1",
+                'for i in $(seq 1 3000); do echo "cao-line-$i"; done',
+                "Enter",
+            )
+            assert fill.returncode == 0, f"could not drive the probe pane: {fill.stderr}"
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                out = client.get_history(
+                    "depth-probe", "win1", strip_escapes=True, visible_only=True
+                )
+                if "cao-line-3000" in out:
+                    break
+                time.sleep(0.5)
+            else:
+                pytest.fail("the probe pane never finished printing 3000 lines")
+
+            deep = client.get_history("depth-probe", "win1", strip_escapes=True, full_history=True)
+            shallow = client.get_history("depth-probe", "win1", strip_escapes=True, tail_lines=1000)
+
+            assert deep.count("\n") > shallow.count("\n"), (
+                "the full_history rung must read deeper than a 1000-line tail, "
+                "not get clamped to the same scrollback cap (#728)"
+            )
+            # Exact line, not a substring: "cao-line-1" also matches
+            # "cao-line-1000" and would pass against a 2000-line buffer.
+            printed = deep.splitlines()
+            assert "cao-line-1" in printed, (
+                "the earliest line must still be in scrollback: with tmux's "
+                "2000-line default the first ~1000 lines have already been "
+                "discarded, which is how a long worker reply is lost (#728)"
+            )
+            assert "cao-line-3000" in printed
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+
+class TestKillRefusesForeignSessions:
+    """CAO shares the operator's tmux server; kills stay inside the cao- namespace."""
+
+    def test_kill_session_refuses_unprefixed_name_before_any_lookup(self, tmux):
+        with pytest.raises(ValueError, match="only acts on sessions it created"):
+            tmux.kill_session("dev")
+        tmux.server.sessions.get.assert_not_called()
+        tmux.server.cmd.assert_not_called()
+
+    def test_kill_session_cli_fallback_is_never_reached_for_a_foreign_name(self, tmux):
+        with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
+            with pytest.raises(ValueError):
+                tmux.kill_session("dev")
+        mock_subprocess.run.assert_not_called()
+
+    def test_kill_window_refuses_unprefixed_session(self, tmux):
+        with pytest.raises(ValueError, match="only acts on sessions it created"):
+            tmux.kill_window("dev", "editor")
+        tmux.server.sessions.get.assert_not_called()
+
+    def test_prefixed_name_proceeds_to_the_normal_path(self, tmux):
+        tmux.server.sessions.get.return_value = None
+        assert tmux.kill_session("cao-dev") is False  # absent, not refused
+        tmux.server.sessions.get.assert_called_once()

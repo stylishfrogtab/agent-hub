@@ -1,0 +1,81 @@
+"""Info command for CLI Agent Orchestrator CLI."""
+
+import os
+import subprocess
+from typing import Optional
+
+import click
+
+from cli_agent_orchestrator.clients.tmux import WEB_VIEW_OWNER_OPTION, web_view_owner
+from cli_agent_orchestrator.constants import (
+    DATABASE_FILE,
+    SERVER_HOST,
+    SERVER_PORT,
+    SESSION_PREFIX,
+)
+from cli_agent_orchestrator.utils import api_http
+
+
+def _read_view_owner(view_name: str) -> Optional[str]:
+    """The agent session a browser view session belongs to, from its owner tag."""
+    try:
+        result = subprocess.run(
+            ["tmux", "show-options", "-v", "-t", f"={view_name}", WEB_VIEW_OWNER_OPTION],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return result.stdout.strip() or None
+
+
+@click.command()
+def info():
+    """Display information about the current session."""
+    try:
+        # Display database path
+        click.echo(f"Database path: {DATABASE_FILE}")
+
+        # Try to get current session name:
+        # 1. Check CAO_SESSION_NAME env var (set by herdr backend)
+        # 2. Fall back to tmux display-message (works for tmux backend)
+        session_name = os.environ.get("CAO_SESSION_NAME")
+
+        if not session_name:
+            try:
+                result = subprocess.run(
+                    ["tmux", "display-message", "-p", "#S"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                session_name = result.stdout.strip()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+            # While a browser terminal shows this agent, '#S' can name its
+            # private view session (caoweb-*), which links the agent's window.
+            session_name = web_view_owner(session_name, _read_view_owner)
+
+        if session_name and session_name.startswith(SESSION_PREFIX):
+            try:
+                # Call API to get session details
+                url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/{session_name}"
+                response = api_http.get(url)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    terminals = data.get("terminals", [])
+                    click.echo(f"Session ID: {session_name}")
+                    click.echo(f"Active terminals: {len(terminals)}")
+                else:
+                    click.echo(
+                        f"Session ID: {session_name} (Warning: Session not found in CAO server)"
+                    )
+            except api_http.exceptions.RequestException:
+                click.echo(f"Session ID: {session_name} (Warning: Could not connect to CAO server)")
+        else:
+            click.echo("Not currently in a CAO session.")
+
+    except Exception as e:
+        raise click.ClickException(str(e))

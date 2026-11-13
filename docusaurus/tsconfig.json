@@ -1,0 +1,17 @@
+// This file is not used by "docusaurus start/build" commands.
+// It is here to improve your IDE experience (type-checking, autocompletion...),
+// and can also run the package.json "typecheck" script manually.
+{
+  "extends": "@docusaurus/tsconfig",
+  "compilerOptions": {
+    // TypeScript 7 removed `baseUrl`. Unset the value from @docusaurus/tsconfig
+    // and keep `@site/*` relative to this directory.
+    "baseUrl": null,
+    "paths": {
+      "@site/*": ["./*"]
+    },
+    "ignoreDeprecations": "6.0",
+    "strict": true
+  },
+  "exclude": [".docusaurus", "build"]
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "learning-proposal.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "project",
+    "intent",
+    "space",
+    "destination",
+    "heading",
+    "rule",
+    "evidence",
+    "source"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "project": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "intent": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "space": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "destination": { "enum": ["project", "team"] },
+    "heading": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "rule": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "source": {
+      "type": "object",
+      "required": ["stage"],
+      "additionalProperties": false,
+      "properties": {
+        "stage": { "type": "string", "minLength": 1 }
+      }
+    },
+    "status": { "enum": ["pending", "promoted", "rejected"] },
+    "createdAt": { "type": "string", "minLength": 1 },
+    "updatedAt": { "type": "string", "minLength": 1 },
+    "promotedAt": { "type": "string", "minLength": 1 },
+    "promotedBy": { "type": "string", "minLength": 1 },
+    "memory": {
+      "type": "object",
+      "required": ["scope", "memoryType", "key"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "memoryType": { "type": "string", "minLength": 1 },
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "maxLength": 60
+        }
+      }
+    },
+    "rejectedAt": { "type": "string", "minLength": 1 },
+    "rejectionReason": { "type": "string", "minLength": 1 }
+  }
+}

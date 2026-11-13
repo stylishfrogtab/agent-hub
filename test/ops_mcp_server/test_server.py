@@ -1,0 +1,1231 @@
+"""Tests for the CAO operations MCP server."""
+
+import os
+from typing import TypedDict
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+from cli_agent_orchestrator.ops_mcp_server.models import (
+    InstallResult,
+    LaunchResult,
+    ProfileListResult,
+    SendMessageResult,
+    SessionListResult,
+)
+from cli_agent_orchestrator.ops_mcp_server.server import (
+    _HTTP_TIMEOUT,
+    _launch_session_impl,
+    _lookup_session,
+    _request_json,
+    get_profile_details,
+    get_session_info,
+    get_terminal_output,
+    get_terminal_status,
+    install_profile,
+    launch_session,
+    list_profiles,
+    list_sessions,
+    main,
+    send_session_message,
+    shutdown_session,
+)
+
+# What ``synchronous_create_timeout`` is stubbed to return in the launch tests
+# below: ``POST /sessions`` WITHOUT ``initial_message`` is answered only after
+# provider init, so its budget is derived from ``provider_init_timeout`` rather
+# than being ``_HTTP_TIMEOUT`` (issue #710).
+_SYNC_CREATE_TIMEOUT = (5.0, 430.0)
+_SYNC_CREATE_BUDGET = "cli_agent_orchestrator.ops_mcp_server.server.synchronous_create_timeout"
+
+
+class InstallPayload(TypedDict):
+    """Typed payload used for InstallResult assertions."""
+
+    success: bool
+    message: str
+    agent_name: str
+    context_file: str
+    agent_file: str | None
+    unresolved_vars: list[str] | None
+
+
+def _response(
+    *,
+    status_code: int = 200,
+    json_data=None,
+    text: str = "",
+):
+    """Create a mock HTTP response."""
+    response = MagicMock()
+    response.status_code = status_code
+    response.text = text
+    response.json.return_value = json_data
+    return response
+
+
+@pytest.mark.asyncio
+class TestProfileTools:
+    """Tests for profile management tools."""
+
+    async def test_list_profiles_returns_non_empty_list(self) -> None:
+        """Profile listing should wrap the API list in a ProfileListResult."""
+        profiles = [{"name": "developer", "description": "Writes code", "source": "built-in"}]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=profiles),
+        ) as mock_request:
+            result = await list_profiles()
+
+        assert result == ProfileListResult(success=True, profiles=profiles)
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/agents/profiles",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_list_profiles_returns_empty_list(self) -> None:
+        """Empty profile stores should still be a successful result."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=[]),
+        ):
+            result = await list_profiles()
+
+        assert result == ProfileListResult(success=True, profiles=[])
+
+    async def test_list_profiles_returns_failure_on_api_error(self) -> None:
+        """Profile listing should convert API errors into failed results."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=500, json_data={"detail": "server exploded"}),
+        ):
+            result = await list_profiles()
+
+        assert result == ProfileListResult(
+            success=False,
+            message="List profiles failed: server exploded",
+            profiles=[],
+        )
+
+    async def test_get_profile_details_returns_profile(self) -> None:
+        """Profile details should return the parsed profile payload."""
+        profile = {"name": "developer", "description": "Writes code", "system_prompt": "Build it"}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=profile),
+        ):
+            result = await get_profile_details("developer")
+
+        assert result == profile
+
+    async def test_get_profile_details_returns_failure_for_missing_profile(self) -> None:
+        """Missing profiles should be returned as a tool failure."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Profile not found"}),
+        ):
+            result = await get_profile_details("missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get profile details for 'missing' failed: Profile not found",
+        }
+
+    async def test_get_profile_details_returns_failure_on_request_exception(self) -> None:
+        """Transport errors should be returned instead of raised."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("boom"),
+        ):
+            result = await get_profile_details("developer")
+
+        assert result == {
+            "success": False,
+            "message": "Get profile details for 'developer' failed: boom",
+        }
+
+    async def test_install_profile_returns_result_for_name_source(self) -> None:
+        """Installing by agent name should return InstallResult."""
+        payload: InstallPayload = {
+            "success": True,
+            "message": "Agent 'developer' installed successfully",
+            "agent_name": "developer",
+            "context_file": "/tmp/developer.md",
+            "agent_file": "/tmp/developer.json",
+            "unresolved_vars": None,
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await install_profile("developer", provider="kiro_cli")
+
+        assert result == InstallResult(**payload)
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/agents/profiles/install",
+            params=None,
+            json={"source": "developer", "provider": "kiro_cli"},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_install_profile_returns_result_for_url_source(self) -> None:
+        """Installing by URL should pass the URL through unchanged."""
+        payload: InstallPayload = {
+            "success": True,
+            "message": "Agent 'remote' installed successfully",
+            "agent_name": "remote",
+            "context_file": "/tmp/remote.md",
+            "agent_file": "/tmp/remote.json",
+            "unresolved_vars": ["BASE_URL"],
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await install_profile("https://example.com/remote.md", provider="kiro_cli")
+
+        assert result == InstallResult(**payload)
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/agents/profiles/install",
+            params=None,
+            json={"source": "https://example.com/remote.md", "provider": "kiro_cli"},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_install_profile_omits_provider_when_not_explicit(self) -> None:
+        """Omitted provider should be left out of the body so the install API
+        resolves the profile's frontmatter provider (GH #414)."""
+        payload: InstallPayload = {
+            "success": True,
+            "message": "Agent 'developer' installed successfully",
+            "agent_name": "developer",
+            "context_file": "/tmp/developer.md",
+            "agent_file": None,
+            "unresolved_vars": None,
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await install_profile("developer")
+
+        assert result == InstallResult(**payload)
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/agents/profiles/install",
+            params=None,
+            json={"source": "developer"},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_install_profile_forwards_env_vars(self) -> None:
+        """Env var maps should be forwarded to the API install endpoint."""
+        payload = {
+            "success": True,
+            "message": "installed",
+            "agent_name": "developer",
+            "context_file": "/tmp/developer.md",
+            "agent_file": None,
+            "unresolved_vars": None,
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            await install_profile(
+                "developer",
+                provider="kiro_cli",
+                env_vars={"API_TOKEN": "secret", "BASE_URL": "http://localhost:27124"},
+            )
+
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/agents/profiles/install",
+            params=None,
+            json={
+                "source": "developer",
+                "provider": "kiro_cli",
+                "env_vars": {"API_TOKEN": "secret", "BASE_URL": "http://localhost:27124"},
+            },
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_install_profile_returns_failure_for_invalid_provider(self) -> None:
+        """Invalid provider responses should become failed InstallResults."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=400, json_data={"detail": "Invalid provider"}),
+        ):
+            result = await install_profile("developer", provider="bad_provider")
+
+        assert result == InstallResult(
+            success=False,
+            message="Install profile 'developer' failed: Invalid provider",
+            agent_name=None,
+            context_file=None,
+            agent_file=None,
+            unresolved_vars=None,
+        )
+
+    async def test_install_profile_returns_failure_on_api_error(self) -> None:
+        """Transport failures should return failed InstallResults."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("network down"),
+        ):
+            result = await install_profile("developer")
+
+        assert result == InstallResult(
+            success=False,
+            message="Install profile 'developer' failed: network down",
+            agent_name=None,
+            context_file=None,
+            agent_file=None,
+            unresolved_vars=None,
+        )
+
+
+@pytest.mark.asyncio
+class TestSessionLifecycleTools:
+    """Tests for session lifecycle tools."""
+
+    async def test_launch_session_omits_provider_when_not_explicit(self) -> None:
+        """Omitted provider should let the session API resolve the profile provider."""
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.generate_session_name",
+                return_value="cao-generated",
+            ),
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                return_value=_response(json_data={"id": "term-123"}),
+            ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET, return_value=_SYNC_CREATE_TIMEOUT),
+        ):
+            result = await _launch_session_impl(
+                agent_profile="developer",
+                allowed_tools=["fs_read", "execute_bash"],
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message="Session 'cao-generated' launched successfully",
+            session_name="cao-generated",
+            terminal_id="term-123",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "agent_profile": "developer",
+                "session_name": "cao-generated",
+                "allowed_tools": "fs_read,execute_bash",
+            },
+            json={"description": None},
+            timeout=_SYNC_CREATE_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_launch_session_passes_custom_params(self) -> None:
+        """Custom session name and working directory should be forwarded to the API."""
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                return_value=_response(json_data={"id": "term-456"}),
+            ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET, return_value=_SYNC_CREATE_TIMEOUT),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="custom-session",
+                working_directory="/workspace/project",
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message="Session 'custom-session' launched successfully",
+            session_name="custom-session",
+            terminal_id="term-456",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "developer",
+                "session_name": "custom-session",
+                "working_directory": "/workspace/project",
+            },
+            json=None,
+            timeout=_SYNC_CREATE_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_launch_session_without_a_message_sizes_the_create_from_provider_init(
+        self,
+    ) -> None:
+        """Issue #710 (review on PR #1002, P2-1). Without ``initial_message``
+        cao-server holds ``POST /sessions`` until ``provider.initialize()``
+        returns, so the budget must be derived from ``provider_init_timeout``
+        for THIS profile -- a flat 300s read was below a successful Antigravity
+        init (370s at stock settings). The connect half stays short so a dead
+        server still reports promptly."""
+        reads = []
+        for init_timeout in (60, 240):
+            with (
+                patch(
+                    "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                    return_value=_response(json_data={"id": "term-sync"}),
+                ) as mock_request,
+                patch(
+                    "cli_agent_orchestrator.services.settings_service.get_server_settings",
+                    return_value={
+                        "provider_init_timeout": init_timeout,
+                        "mcp_request_timeout": 30,
+                    },
+                ),
+                patch(
+                    "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+                    side_effect=FileNotFoundError("no override on this box"),
+                ),
+            ):
+                result = await launch_session(agent_profile="developer", session_name="sync")
+
+            assert result.success is True
+            timeout = mock_request.call_args.kwargs["timeout"]
+            assert timeout != _HTTP_TIMEOUT
+            assert isinstance(timeout, tuple), f"expected (connect, read), got {timeout!r}"
+            connect, read = timeout
+            assert connect == 5
+            assert read > 300, "the flat 300s read was below a successful Antigravity init"
+            reads.append(read)
+
+        assert reads[1] > reads[0], "raising provider_init_timeout must move the budget"
+
+    async def test_launch_session_with_a_message_keeps_the_ordinary_budget(self) -> None:
+        """With ``initial_message`` the server defers init and answers at once,
+        so widening this budget would only slow down reporting a wedged server."""
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                return_value=_response(json_data={"id": "term-deferred"}),
+            ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET) as mock_budget,
+        ):
+            result = await launch_session(
+                agent_profile="developer", session_name="deferred", initial_message="go"
+            )
+
+        assert result.success is True
+        assert mock_request.call_args.kwargs["timeout"] == _HTTP_TIMEOUT
+        mock_budget.assert_not_called()
+
+    async def test_launch_session_result_includes_provider_from_api_response(self) -> None:
+        """The Terminal model's provider field should be surfaced on LaunchResult."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-789", "provider": "codex"}),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="provider-session",
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message="Session 'provider-session' launched successfully",
+            session_name="provider-session",
+            terminal_id="term-789",
+            provider="codex",
+        )
+
+    async def test_launch_session_passes_model_and_initial_message(self) -> None:
+        """The model stays in routing params and the first task stays in JSON."""
+        initial_message = "Review the current change"
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-789"}),
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="model-session",
+                model="gpt-5.1-codex",
+                initial_message=initial_message,
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message=(
+                "Session 'model-session' launched; " "initial message delivery is in progress"
+            ),
+            session_name="model-session",
+            terminal_id="term-789",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "developer",
+                "session_name": "model-session",
+                "model": "gpt-5.1-codex",
+            },
+            json={"initial_message": initial_message},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+        request_url = mock_request.call_args.args[1]
+        request_params = mock_request.call_args.kwargs["params"]
+        assert initial_message not in request_url
+        assert initial_message not in str(request_params)
+
+    async def test_launch_session_forwards_env_vars(self) -> None:
+        """Forwarded env vars ride the JSON body (never the URL/params), the
+        same wire shape as ``cao launch --env``."""
+        env_vars = {"DEV_ACCOUNT": "123456789012", "BASE_URL": "http://localhost:8080"}
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                return_value=_response(json_data={"id": "term-env"}),
+            ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET, return_value=_SYNC_CREATE_TIMEOUT),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="env-session",
+                env_vars=env_vars,
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message="Session 'env-session' launched successfully",
+            session_name="env-session",
+            terminal_id="term-env",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "agent_profile": "developer",
+                "session_name": "env-session",
+            },
+            json={"env_vars": env_vars},
+            timeout=_SYNC_CREATE_TIMEOUT,
+            headers=None,
+        )
+        # A forwarded value must not leak into the URL or query params.
+        request_url = mock_request.call_args.args[1]
+        request_params = mock_request.call_args.kwargs["params"]
+        assert "env_vars" not in request_params
+        assert "123456789012" not in request_url
+        assert "123456789012" not in str(request_params)
+
+    async def test_launch_session_forwards_env_vars_with_initial_message(self) -> None:
+        """env_vars and initial_message coexist in the JSON body."""
+        env_vars = {"REGION": "us-west-2"}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-both"}),
+        ) as mock_request:
+            await launch_session(
+                agent_profile="developer",
+                session_name="both-session",
+                initial_message="do the thing",
+                env_vars=env_vars,
+            )
+
+        assert mock_request.call_args.kwargs["json"] == {
+            "initial_message": "do the thing",
+            "env_vars": env_vars,
+        }
+
+    async def test_launch_session_rejects_invalid_env_before_api_call(self) -> None:
+        """A forwarded env var breaking the forwarding rules fails at the MCP
+        boundary (mirroring ``cao launch --env``) with no HTTP request made."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-env",
+                env_vars={"CLAUDE_SESSION_ID": "abc"},  # blocked provider prefix
+            )
+
+        assert result.success is False
+        assert "blocked prefix" in result.message
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
+    async def test_launch_session_rejects_non_utf8_env_without_crashing(self) -> None:
+        """A lone surrogate is a valid JSON/FastMCP str but is not UTF-8
+        encodable. It must return success=False (not raise a ToolError wrapping
+        UnicodeEncodeError) and make no HTTP request. Regression for the P2
+        review finding on PR #729."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-utf8",
+                env_vars={"X": "\ud800"},  # lone surrogate, not UTF-8 encodable
+            )
+
+        assert result.success is False
+        assert "not valid UTF-8" in result.message
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
+    async def test_launch_session_rejects_nul_byte_env_without_crashing(self) -> None:
+        """A NUL byte in a value passes the length check but breaks Popen and
+        leaks the argv into logs. It must return success=False before any HTTP
+        request. Regression for the P1 review finding on PR #729."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-nul",
+                env_vars={"TOKEN": "secret\x00value"},
+            )
+
+        assert result.success is False
+        assert "NUL byte" in result.message
+        assert "secret" not in result.message  # value must not leak
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
+    async def test_launch_session_returns_invalid_model_error(self) -> None:
+        """Request-boundary model errors are returned instead of ignored."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                status_code=400,
+                json_data={"detail": "model 'invalid;model' is invalid"},
+            ),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                model="invalid;model",
+            )
+
+        assert result.success is False
+        assert result.message == ("Launch session failed: model 'invalid;model' is invalid")
+        assert result.terminal_id is None
+
+    async def test_launch_session_returns_failure_on_api_error(self) -> None:
+        """Session API errors should return failed LaunchResults."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=500, json_data={"detail": "server exploded"}),
+        ):
+            result = await _launch_session_impl("developer")
+
+        assert result.success is False
+        assert result.message == "Launch session failed: server exploded"
+
+    async def test_launch_session_returns_failure_on_missing_id_in_response(self) -> None:
+        """Session payloads without an ``id`` field should be treated as failures."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"foo": "bar"}),
+        ):
+            result = await _launch_session_impl("developer")
+
+        assert result.success is False
+        assert result.message == "Launch session failed: invalid session response"
+        assert result.terminal_id is None
+        assert result.session_name is not None
+
+    async def test_launch_session_returns_failure_on_non_dict_response(self) -> None:
+        """Non-dict session payloads should also be treated as failures."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=["unexpected", "list"]),
+        ):
+            result = await _launch_session_impl("developer")
+
+        assert result.success is False
+        assert result.message == "Launch session failed: invalid session response"
+        assert result.terminal_id is None
+
+    async def test_send_session_message_queues_message(self) -> None:
+        """A successful inbox delivery should return SendMessageResult with success."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"success": True}),
+        ) as mock_request:
+            result = await send_session_message(terminal_id="term-123", message="Build feature X")
+
+        assert result == SendMessageResult(
+            success=True,
+            message="Message queued for terminal 'term-123'",
+            terminal_id="term-123",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/terminals/term-123/inbox/messages",
+            params={"sender_id": "cao-ops-mcp", "message": "Build feature X"},
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_send_session_message_returns_failure_for_not_found(self) -> None:
+        """A 404 response should return a failed SendMessageResult."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Terminal not found"}),
+        ):
+            result = await send_session_message(terminal_id="missing", message="hello")
+
+        assert result == SendMessageResult(
+            success=False,
+            message="Send message to terminal 'missing' failed: Terminal not found",
+            terminal_id="missing",
+        )
+
+    async def test_send_session_message_returns_failure_on_api_error(self) -> None:
+        """Transport errors should return failed SendMessageResults."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("api offline"),
+        ):
+            result = await send_session_message(terminal_id="term-123", message="hello")
+
+        assert result == SendMessageResult(
+            success=False,
+            message="Send message to terminal 'term-123' failed: api offline",
+            terminal_id="term-123",
+        )
+
+    async def test_send_session_message_includes_terminal_id_on_failure(self) -> None:
+        """The terminal_id should always be echoed back regardless of outcome."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=500, text="internal error"),
+        ):
+            result = await send_session_message(terminal_id="term-abc", message="ping")
+
+        assert result.success is False
+        assert result.terminal_id == "term-abc"
+
+    async def test_list_sessions_returns_list(self) -> None:
+        """Session listing should wrap the API payload in a SessionListResult."""
+        sessions = [{"session_name": "cao-123", "terminal_count": 2}]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=sessions),
+        ):
+            result = await list_sessions()
+
+        assert result == SessionListResult(success=True, sessions=sessions)
+        dumped_session = result.model_dump()["sessions"][0]
+        assert dumped_session["session_name"] == "cao-123"
+        assert dumped_session["terminal_count"] == 2
+        assert "working_directory" in dumped_session
+
+    async def test_list_sessions_returns_empty_list(self) -> None:
+        """Empty session lists should still be a successful result."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=[]),
+        ):
+            result = await list_sessions()
+
+        assert result == SessionListResult(success=True, sessions=[])
+
+    async def test_list_sessions_returns_failure_on_api_error(self) -> None:
+        """Session list errors should be returned as failed results."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("api offline"),
+        ):
+            result = await list_sessions()
+
+        assert result == SessionListResult(
+            success=False,
+            message="List sessions failed: api offline",
+            sessions=[],
+        )
+
+    async def test_get_session_info_returns_payload(self) -> None:
+        """Session details should be returned unchanged."""
+        payload = {
+            "name": "cao-123",
+            "terminals": [{"id": "term-1", "model": "model-x", "model_honored": True}],
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ):
+            result = await get_session_info("cao-123")
+
+        assert result == payload
+
+    async def test_get_session_info_returns_failure_for_not_found(self) -> None:
+        """Missing sessions should be converted into failure dicts."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Session not found"}),
+        ):
+            result = await get_session_info("missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get session info for 'missing' failed: Session not found",
+        }
+
+    async def test_get_session_info_returns_failure_on_api_error(self) -> None:
+        """Transport errors should be returned for session info lookups."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("boom"),
+        ):
+            result = await get_session_info("cao-123")
+
+        assert result == {
+            "success": False,
+            "message": "Get session info for 'cao-123' failed: boom",
+        }
+
+    async def test_get_session_info_reads_the_canonical_name_only(self) -> None:
+        """A bare name (e.g. what launch_session's session_name echoed back)
+        must resolve, since sessions are actually stored as "cao-<name>".
+
+        It is read as ``cao-<name>`` directly, never as the literal name first:
+        an unprefixed name can never BE a CAO session (both creation paths
+        enforce the prefix), so a native tmux session answering that GET would
+        be the wrong session entirely.
+        """
+        payload = {"name": "cao-acc-agy", "terminals": [{"id": "term-1"}]}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await get_session_info("acc-agy")
+
+        assert result == payload
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-acc-agy",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_get_session_info_does_not_retry_when_already_prefixed(self) -> None:
+        """A name already carrying the prefix must not be retried again on 404."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Session not found"}),
+        ) as mock_request:
+            result = await get_session_info("cao-missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get session info for 'cao-missing' failed: Session not found",
+        }
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-missing",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_get_session_info_surfaces_a_non_404_error_without_a_second_read(
+        self,
+    ) -> None:
+        """A non-404 error (e.g. 500) is reported from the one canonical read."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=500, json_data={"detail": "Internal error"}),
+        ) as mock_request:
+            result = await get_session_info("acc-agy")
+
+        assert result == {
+            "success": False,
+            "message": "Get session info for 'acc-agy' failed: Internal error",
+        }
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-acc-agy",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_shutdown_session_canonicalizes_a_bare_name_before_deleting(
+        self,
+    ) -> None:
+        """A bare name is canonicalized, checked by GET, and deleted once.
+
+        The literal name is never probed, let alone deleted: it cannot be a CAO
+        session, and a native tmux session under it would answer the GET. The
+        delete cannot report a wrong target itself either -- the real endpoint
+        answers 200 for an absent session (it is idempotent), so a bare-name
+        DELETE would report success while ``cao-acc-agy`` stayed live. See
+        ``test_shutdown_session_canonical_name.py`` for the same contract proven
+        against the real route with a native session actually present.
+        """
+        payload = {"success": True, "deleted": ["cao-acc-agy"], "errors": []}
+        responses = [
+            _response(json_data={"session": {"id": "cao-acc-agy"}, "terminals": []}),
+            _response(json_data=payload),
+        ]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=responses,
+        ) as mock_request:
+            result = await shutdown_session("acc-agy")
+
+        assert result == payload
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+            ("delete", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_deletes_an_already_canonical_name_directly(
+        self,
+    ) -> None:
+        """A prefixed name resolves on the first read and is deleted as given."""
+        payload = {"success": True, "deleted": ["cao-acc-agy"], "errors": []}
+        responses = [
+            _response(json_data={"session": {"id": "cao-acc-agy"}, "terminals": []}),
+            _response(json_data=payload),
+        ]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=responses,
+        ) as mock_request:
+            result = await shutdown_session("cao-acc-agy")
+
+        assert result == payload
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+            ("delete", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_deletes_the_canonical_name_when_it_is_absent(
+        self,
+    ) -> None:
+        """The canonical name confirmed absent (404): delete it anyway, once.
+
+        Live-backend presence is not the cleanup identity. ``get_session``
+        requires the backend session, so a deferred cleanup -- whose retained
+        registry row is the retry handle -- 404s once the backend session is
+        gone; that row lives under ``cao-<name>``. Retargeting anything else
+        would answer 200 and clean up nothing. For a name that never existed,
+        the canonical delete is the same idempotent "already gone" success
+        rather than an invented client-side error.
+        """
+        payload = {"success": True, "deleted": ["cao-acc-agy"], "errors": []}
+        responses = [
+            _response(status_code=404, json_data={"detail": "Session 'cao-acc-agy' not found"}),
+            _response(json_data=payload),
+        ]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=responses,
+        ) as mock_request:
+            result = await shutdown_session("acc-agy")
+
+        assert result == payload
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+            ("delete", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_aborts_when_the_lookup_cannot_resolve(self) -> None:
+        """A non-404 lookup failure is unresolved, not absent: delete nothing.
+
+        Only a 404 is evidence of absence. A 500 (the real route returns one
+        when reading a terminal's status fails), a 403 or a transport error
+        leaves the cleanup target unknown, and deleting an unresolved alias
+        would answer 200 while the canonical session stayed live.
+        """
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                status_code=500, json_data={"detail": "Failed to get session: boom"}
+            ),
+        ) as mock_request:
+            result = await shutdown_session("acc-agy")
+
+        assert result == {
+            "success": False,
+            "message": (
+                "Shutdown session 'acc-agy' aborted: lookup of session 'cao-acc-agy' "
+                "failed: Failed to get session: boom; no delete was issued"
+            ),
+        }
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_returns_success_payload(self) -> None:
+        """Shutdown should return the API success payload."""
+        payload = {"success": True, "deleted_terminals": 2}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ):
+            result = await shutdown_session("cao-123")
+
+        assert result == payload
+
+    async def test_shutdown_session_returns_failure_for_not_found(self) -> None:
+        """A DELETE that does 404 is surfaced as a failure.
+
+        The real endpoint is idempotent and does not answer 404, but a proxy or
+        a future revision could; the canonical name is what was targeted.
+        """
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Session not found"}),
+        ):
+            result = await shutdown_session("missing")
+
+        assert result == {
+            "success": False,
+            "message": "Shutdown session 'cao-missing' failed: Session not found",
+        }
+
+    async def test_shutdown_session_returns_failure_on_api_error(self) -> None:
+        """Shutdown transport errors should be converted into failures.
+
+        An unreachable API fails at the lookup, which is unresolved rather than
+        absent, so no DELETE is issued at all.
+        """
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("delete failed"),
+        ) as mock_request:
+            result = await shutdown_session("cao-123")
+
+        assert result == {
+            "success": False,
+            "message": (
+                "Shutdown session 'cao-123' aborted: lookup of session 'cao-123' "
+                "failed: delete failed; no delete was issued"
+            ),
+        }
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-123"),
+        ]
+
+
+@pytest.mark.asyncio
+class TestTerminalMonitoringTools:
+    """Tests for the worker-monitoring tools used by an external supervisor."""
+
+    async def test_get_terminal_status_returns_terminal_payload(self) -> None:
+        """A successful status read returns the terminal dict including status."""
+        payload = {
+            "id": "term-123",
+            "name": "developer-0",
+            "provider": "claude_code",
+            "session_name": "cao-abc",
+            "agent_profile": "dev-sonnet",
+            "model": "model-x",
+            "model_honored": True,
+            "status": "processing",
+            "last_active": "2026-06-11T00:00:00",
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await get_terminal_status(terminal_id="term-123")
+
+        assert result == payload
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-123",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_get_terminal_status_returns_failure_for_not_found(self) -> None:
+        """A 404 surfaces as a failure dict, not an exception."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Terminal not found"}),
+        ):
+            result = await get_terminal_status(terminal_id="missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get terminal status for 'missing' failed: Terminal not found",
+        }
+
+    async def test_get_terminal_output_defaults_to_last_mode(self) -> None:
+        """Output defaults to the provider-extracted last response."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"output": "done: added foo()", "mode": "last"}),
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123")
+
+        assert result == {"output": "done: added foo()", "mode": "last"}
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-123/output",
+            params={"mode": "last"},
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
+        )
+
+    async def test_get_terminal_output_passes_full_mode(self) -> None:
+        """mode='full' is forwarded as a query param (case-insensitive)."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"output": "buffer...", "mode": "full"}),
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123", mode="FULL")
+
+        assert result["mode"] == "full"
+        assert mock_request.call_args.kwargs["params"] == {"mode": "full"}
+
+    async def test_get_terminal_output_rejects_invalid_mode_without_calling_api(self) -> None:
+        """An unsupported mode fails fast and never hits the API."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123", mode="tail")
+
+        assert result["success"] is False
+        assert "must be 'last' or 'full'" in result["message"]
+        mock_request.assert_not_called()
+
+    async def test_get_terminal_output_returns_failure_on_api_error(self) -> None:
+        """Transport errors surface as a failure dict."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("api offline"),
+        ):
+            result = await get_terminal_output(terminal_id="term-123")
+
+        assert result == {
+            "success": False,
+            "message": "Get terminal output for 'term-123' failed: api offline",
+        }
+
+
+def test_main_runs_mcp_server_over_stdio_only() -> None:
+    """main() pins the transport; FASTMCP_TRANSPORT in the environment must not win."""
+    with patch("cli_agent_orchestrator.ops_mcp_server.server.mcp.run") as mock_run:
+        with patch.dict(os.environ, {"FASTMCP_TRANSPORT": "http"}):
+            main()
+
+    mock_run.assert_called_once_with(transport="stdio")
+
+
+def test_plugin_mcp_surfaces_are_registered_on_ops_server() -> None:
+    """Entry-point plugins get on_mcp_server() called with the ops server's FastMCP
+    instance, so plugin tools reach external coordinators too."""
+    import importlib
+
+    import cli_agent_orchestrator.ops_mcp_server.server as ops_server
+
+    with patch(
+        "cli_agent_orchestrator.plugins.registry.register_mcp_server_surfaces"
+    ) as mock_register:
+        reloaded = importlib.reload(ops_server)
+        mock_register.assert_called_once_with(reloaded.mcp)
+    importlib.reload(ops_server)
+
+
+class TestLocalBearer:
+    """Reported by review 5222539218 on #584 (item 7).
+
+    The packaged ``cao-ops`` server reached the CAO API with no ``Authorization``
+    header even when the documented local bearer was configured, so against an
+    auth-enabled API every scope-gated operation returned 401. Both call sites are
+    covered: ``_request_json`` and ``_lookup_session`` (the latter arrived in the
+    rebase with neither a bearer nor a bound).
+    """
+
+    def test_no_authorization_header_when_auth_is_disabled(self, monkeypatch):
+        """Default-off posture is byte-for-byte unchanged apart from headers=None."""
+        monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+        monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"ok": True}),
+        ) as mock_request:
+            _request_json("get", "/health", operation="Probe")
+        assert mock_request.call_args.kwargs["headers"] is None
+
+    def test_bearer_is_attached_when_auth_is_enabled_and_a_local_token_is_set(self, monkeypatch):
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "tok")
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"ok": True}),
+        ) as mock_request:
+            _request_json("get", "/health", operation="Probe")
+        assert mock_request.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    def test_auth_enabled_without_a_token_returns_the_actionable_error_and_sends_nothing(
+        self, monkeypatch
+    ):
+        """A bare 401 is replaced by a message naming the variable to set."""
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch("cli_agent_orchestrator.ops_mcp_server.server.requests.request") as mock_request:
+            data, error = _request_json("get", "/health", operation="Probe")
+        assert data is None
+        assert "CAO_AUTH_LOCAL_TOKEN" in error
+        mock_request.assert_not_called()
+
+    def test_the_session_lookup_also_carries_the_bearer(self, monkeypatch):
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "tok")
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"name": "cao-x"}),
+        ) as mock_request:
+            found, error = _lookup_session("cao-x")
+        assert (found, error) == (True, None)
+        assert mock_request.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    def test_the_session_lookup_is_bounded_by_the_same_timeout(self):
+        """An unbounded probe here would hang ``shutdown_session`` indefinitely."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"name": "cao-x"}),
+        ) as mock_request:
+            _lookup_session("cao-x")
+        assert mock_request.call_args.kwargs["timeout"] == _HTTP_TIMEOUT
+
+    def test_the_session_lookup_reports_the_misconfiguration_as_unresolved(self, monkeypatch):
+        """Not absence: a misconfigured hop must not read as 'no such session'."""
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch("cli_agent_orchestrator.ops_mcp_server.server.requests.request") as mock_request:
+            found, error = _lookup_session("cao-x")
+        assert found is False
+        assert error is not None and "CAO_AUTH_LOCAL_TOKEN" in error
+        mock_request.assert_not_called()

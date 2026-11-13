@@ -1,0 +1,2332 @@
+"""Tests for U4 ScriptRunner (issue #312, Bolt 3, C1).
+
+The subprocess is MOCKED throughout (fast, hermetic, default matrix) — the
+OS-touching proofs live under the ``e2e`` marker in
+``test/e2e/script_runner/test_script_runner_e2e.py``. The one exception is
+``test_close_pipes_closes_a_real_process_transport``, which spawns a short-lived
+real child because ``_close_pipes`` depends on a private attribute of
+``asyncio.subprocess.Process`` that the fakes cannot vouch for. Coverage maps
+to the code-generation test plan:
+
+- M1 result-shape contract: a script COMPLETED result has the same base fields
+  as a YAML run + ``kind=None``/``output``/``warnings=[]`` (INV-5).
+- crash lifecycle: nonzero exit -> ``FAILED, kind=error``, stderr tail surfaced,
+  orphan sweep fired.
+- hang lifecycle: exit never arrives -> ``TimeoutBound`` -> ``_terminate`` ->
+  ``FAILED, kind=timeout``; generation bumped on the timeout arm (INV-6).
+- cancel lifecycle: signal-first order; a second cancel is a logged no-op.
+- resume admission: absent -> 404 (``KeyError``); live -> 409
+  (``ResumeNotAllowedError``); non-resumable -> 409; corrupt snapshot -> 422
+  (``ResumeCorruptError``); happy resume materializes + execs a temp file and
+  deletes it in ``finally``.
+- sentinel present/absent/malformed/duplicate (last-match); skipped on FAILED.
+- ring-buffer truncation marker.
+- orphan sweep off the in-memory ``step_states`` (BR-31 5b).
+- pipe-drain no-deadlock: a chatty child (> 1 MiB) drains without deadlock.
+
+Async tests use ``@pytest.mark.asyncio``. The journal points at a temp SQLite
+DB via the patched ``DATABASE_FILE`` (same fixture idiom as the U3 tests).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+import pytest
+
+from cli_agent_orchestrator.clients.database import (
+    _migrate_workflow_run,
+    _migrate_workflow_run_step,
+)
+from cli_agent_orchestrator.models.workflow import StepState
+from cli_agent_orchestrator.models.workflow_runtime import RunState, WorkflowRunResult
+from cli_agent_orchestrator.services import script_runner, workflow_journal
+from cli_agent_orchestrator.services.script_runner import (
+    ScriptLintError,
+    ScriptRunRecord,
+    TimeoutBound,
+    _bump,
+    _RingBuffer,
+    _scan_sentinel,
+    build_env,
+    cancel_script_run,
+    make_step_terminal_recorder,
+    record_step_completion,
+    resume_script_run,
+    run_script_workflow,
+    run_script_workflow_prepared,
+)
+from cli_agent_orchestrator.services.workflow_service import (
+    ResumeCorruptError,
+    ResumeNotAllowedError,
+    StepRunState,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures + fakes
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Temp DB + tables; reset the shared registry/active-drives around each test."""
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
+    # issue #583 Bolt 3 (``approval-enforcement-default``): the approval gate now defaults ON, and
+    # every test in this module drives a script run whose plan is not approved. These are tests of the
+    # RUNNER -- spawn, reap, sentinel scanning, resume admission, TOCTOU -- not of approval, so the
+    # gate is turned off here through the real setting. Doing it in the fixture rather than per test
+    # keeps the runner's own behaviour the only variable, and using the setting rather than patching
+    # ``ensure_plan_approved`` out means the gate's disabled path stays genuinely exercised.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+    # Isolate the process-local registry between tests.
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry.clear()
+    workflow_service._active_drives.clear()
+    yield db_path
+    workflow_service.run_registry.clear()
+    workflow_service._active_drives.clear()
+
+
+class _FakeScriptSpec:
+    """Duck-typed stand-in for U5's ScriptSpec (U4 only reads these attrs)."""
+
+    def __init__(self, source: str = "print('hi')", path: str = "/tmp/wf.py", name: str = "wf"):
+        self.source = source
+        self.path = path
+        self.name = name
+        self.content_hash = "deadbeef"
+
+
+class _FakeProcess:
+    """A fake ``asyncio.subprocess.Process`` for lifecycle tests.
+
+    ``returncode`` is None until ``exit_rc`` is delivered. ``wait()`` returns
+    immediately with ``exit_rc`` unless ``hang=True`` (then it awaits forever,
+    exercising the wall-clock reaper). ``terminate``/``kill`` record the signal
+    order and settle the returncode so ``_terminate``'s reap completes — UNLESS
+    ``uncooperative=True``, in which case ``terminate()`` (SIGTERM) is recorded
+    but does NOT settle the process (an uncooperative child that ignores
+    SIGTERM), so only ``kill()`` (SIGKILL) releases ``wait()``.
+    """
+
+    def __init__(
+        self,
+        *,
+        exit_rc: int = 0,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        hang: bool = False,
+        uncooperative: bool = False,
+    ):
+        self._exit_rc = exit_rc
+        self.returncode: Optional[int] = None
+        self.stdout = _FakeStream(stdout)
+        self.stderr = _FakeStream(stderr)
+        self._hang = hang
+        self._uncooperative = uncooperative
+        self.signals: List[str] = []
+        self._exited = asyncio.Event()
+        if not hang:
+            self.returncode = None  # settled by wait()
+
+    async def wait(self) -> int:
+        if self._hang and not self._exited.is_set():
+            await self._exited.wait()
+        if self.returncode is None:
+            self.returncode = self._exit_rc
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.signals.append("SIGTERM")
+        if self._uncooperative:
+            return  # ignores SIGTERM — only kill() below releases wait()
+        # A cooperative child exits on SIGTERM: settle + release wait().
+        self.returncode = self._exit_rc
+        self._exited.set()
+
+    def kill(self) -> None:
+        self.signals.append("SIGKILL")
+        self.returncode = -9
+        self._exited.set()
+
+
+class _FakeStream:
+    """A fake ``StreamReader`` yielding a fixed payload then EOF, in chunks."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self._pos = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._pos >= len(self._payload):
+            return b""
+        chunk = self._payload[self._pos : self._pos + (n if n > 0 else len(self._payload))]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _HeldOpenStream(_FakeStream):
+    """A stream that yields its payload and then never reaches EOF.
+
+    This is what the script's pipes look like when a background process it
+    started inherited them and is still running.
+    """
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk = await super().read(n)
+        if chunk:
+            return chunk
+        await asyncio.Event().wait()
+
+
+class _FakeTransport:
+    """Records whether the drive closed the subprocess pipes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _HeldPipesProcess:
+    """A script that exits while its stdout/stderr stay open.
+
+    ``returncode`` flips from None to ``exit_rc`` after ``exit_after`` seconds,
+    as asyncio sets it when the process exits, whether or not anything is in
+    ``wait()``. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on
+    Python 3.10 it returns at the exit, and from 3.11 a ``wait()`` started
+    before the exit does not return until the pipes reach EOF, which here is
+    never. With ``exit_after=None`` the script runs until it is signalled:
+    SIGKILL ends it at once, SIGTERM 0.02s later and only when ``honours_sigterm``.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        wait_holds_for_pipes: bool,
+        exit_rc: int = 0,
+        exit_after: Optional[float] = 0.05,
+        honours_sigterm: bool = True,
+    ):
+        self.returncode: Optional[int] = None
+        self.stdout = _HeldOpenStream(stdout)
+        self.stderr = _HeldOpenStream(stderr)
+        self._wait_holds_for_pipes = wait_holds_for_pipes
+        self._honours_sigterm = honours_sigterm
+        self._exited = asyncio.Event()
+        self._transport = _FakeTransport()
+        self.signals: List[str] = []
+        if exit_after is not None:
+            asyncio.get_running_loop().call_later(exit_after, self._exit, exit_rc)
+
+    def _exit(self, rc: int) -> None:
+        self.returncode = rc
+        self._exited.set()
+
+    async def wait(self) -> int:
+        if self._wait_holds_for_pipes:
+            await asyncio.Event().wait()
+        await self._exited.wait()
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.signals.append("SIGTERM")
+        if self._honours_sigterm:
+            asyncio.get_running_loop().call_later(0.02, self._exit, -15)
+
+    def kill(self) -> None:
+        self.signals.append("SIGKILL")
+        self._exit(-9)
+
+
+def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: object) -> dict:
+    """Patch ``asyncio.create_subprocess_exec`` to return ``process``; capture args."""
+    captured: dict = {}
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
+        return process
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.script_runner.asyncio.create_subprocess_exec",
+        _fake_exec,
+    )
+    return captured
+
+
+# ---------------------------------------------------------------------------
+# Pure-helper unit tests
+# ---------------------------------------------------------------------------
+def test_scan_sentinel_absent_returns_null():
+    assert _scan_sentinel("no sentinel here\njust logs") == (None, [])
+
+
+def test_scan_sentinel_last_match_wins():
+    text = 'CAO_WORKFLOW_OUTPUT:{"n": 1}\nprogress\nCAO_WORKFLOW_OUTPUT:{"n": 2}'
+    output, warnings = _scan_sentinel(text)
+    assert output == {"n": 2}
+    assert warnings == []
+
+
+def test_scan_sentinel_malformed_payload_warns_output_null():
+    output, warnings = _scan_sentinel("CAO_WORKFLOW_OUTPUT:{not json}")
+    assert output is None
+    assert len(warnings) == 1 and "malformed sentinel payload" in warnings[0]
+
+
+def test_ring_buffer_truncation_marker():
+    ring = _RingBuffer(cap=16)
+    ring.append(b"0123456789")
+    ring.append(b"abcdefghij")  # total 20 > 16 -> drop oldest 4
+    text = ring.text()
+    assert ring.truncated is True
+    assert "output truncated" in text
+    assert text.endswith("456789abcdefghij")
+
+
+def test_ring_buffer_no_truncation_under_cap():
+    ring = _RingBuffer(cap=100)
+    ring.append(b"hello")
+    assert ring.truncated is False
+    assert ring.text() == "hello"
+
+
+def test_bump_increments_integer_generation():
+    assert _bump("1") == "2"
+    assert _bump("9") == "10"
+
+
+def test_bump_non_integer_anchors_to_two():
+    assert _bump("not-a-number") == "2"
+
+
+# ---------------------------------------------------------------------------
+# Unit A — _build_env delivers CAO_WORKFLOW_INPUTS (FR-A3, BR-A5)
+# ---------------------------------------------------------------------------
+def test_build_env_exact_six_keys_with_inputs():
+    env = script_runner._build_env("run-x", "1", {"topic": "birds", "count": 3})
+    assert set(env) == {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
+        "PATH",
+        "HOME",
+    }
+    # Compact JSON, deterministic separators.
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"topic":"birds","count":3}'
+
+
+def test_build_env_two_arg_call_defaults_empty_inputs():
+    """The legacy 2-arg call site still works; inputs default to ``{}``."""
+    env = script_runner._build_env("run-x", "1")
+    assert env["CAO_WORKFLOW_INPUTS"] == "{}"
+    assert "CAO_WORKFLOW_RESUME" not in env
+
+
+def test_build_env_resume_adds_flag_and_keeps_inputs():
+    env = script_runner._build_env("run-x", "4", {"a": 1}, resume=True)
+    assert env["CAO_WORKFLOW_RESUME"] == "1"
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"a":1}'
+
+
+# ---------------------------------------------------------------------------
+# A1 — run_script_workflow lifecycle
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_lint_fail_raises_before_any_spawn(monkeypatch: pytest.MonkeyPatch):
+    """BR-1: a lint fail raises ScriptLintError; zero code runs, no journal row."""
+    spawned = {"called": False}
+
+    async def _boom(*a, **k):  # pragma: no cover — must never be reached
+        spawned["called"] = True
+        raise AssertionError("spawn must not happen on lint fail")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.script_runner.asyncio.create_subprocess_exec", _boom
+    )
+    # A CAO-internal import is a hard disallowed-import ERROR -> status "fail".
+    spec = _FakeScriptSpec(source="import cli_agent_orchestrator\n")
+    with pytest.raises(ScriptLintError) as ei:
+        await run_script_workflow(spec, {}, "run-lint-fail")
+    assert ei.value.findings  # carries U1 findings for U5's 422 body
+    assert spawned["called"] is False
+    assert workflow_journal.get_run("run-lint-fail") is None
+
+
+@pytest.mark.asyncio
+async def test_happy_completed_result_shape_and_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """M1 + A6: exit 0 -> COMPLETED, tier-neutral shape, sentinel output parsed."""
+    proc = _FakeProcess(exit_rc=0, stdout=b'log line\nCAO_WORKFLOW_OUTPUT:{"answer": 42}\n')
+    captured = _install_fake_spawn(monkeypatch, proc)
+    manifest_cwds = []
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None)(**kwargs)
+        ),
+    )
+    result = await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-ok",
+        working_directory=str(tmp_path),
+    )
+
+    assert isinstance(result, WorkflowRunResult)
+    assert result.state == RunState.COMPLETED
+    assert result.run_id == "run-ok"
+    assert result.workflow_name == "wf"
+    assert result.kind is None
+    assert result.output == {"answer": 42}
+    assert result.warnings == []
+    # Journaled with tier=script, generation=1 (additive insert_run kwargs).
+    row = workflow_journal.get_run("run-ok")
+    assert row is not None and row.tier == "script" and row.generation == "1"
+    assert row.state == "completed"
+    # F3: the journaled started_at is the SAME timestamp as the record's, not a
+    # second independent _now() call.
+    assert row.started_at == result.started_at
+    assert script_runner.run_registry["run-ok"].working_directory == os.path.realpath(tmp_path)
+    assert captured["cwd"] == os.path.realpath(tmp_path)
+    assert manifest_cwds == [os.path.realpath(tmp_path)]
+    assert json.loads(row.spec_snapshot)["working_directory"] == os.path.realpath(tmp_path)
+    # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
+    env = captured["env"]
+    assert set(env) == {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
+        "PATH",
+        "HOME",
+    }
+    assert env["CAO_WORKFLOW_RUN_ID"] == "run-ok"
+    assert env["CAO_WORKFLOW_GENERATION"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_blocking_run_persists_launch_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_memory_enabled",
+        lambda: True,
+    )
+    _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-guard-persisted",
+        working_directory=str(tmp_path),
+    )
+
+    snapshot = json.loads(workflow_journal.get_run("run-guard-persisted").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is True
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
+
+
+@pytest.mark.asyncio
+async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPatch):
+    """Nonzero exit -> FAILED with a redacted durable diagnostic and a swept worker."""
+    swept = {"run": None}
+    aws_key = "AKIAIOSFODNN7EXAMPLE"
+
+    async def _fake_sweep(run_id):
+        swept["run"] = run_id
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
+    proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
+    _captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
+    assert swept["run"] == "run-crash"
+    row = workflow_journal.get_run("run-crash")
+    assert row is not None
+    assert getattr(row, "error", None) == "Traceback: boom with [REDACTED:aws_access_key]"
+    assert aws_key not in getattr(row, "error", "")
+
+
+@pytest.mark.asyncio
+async def test_crash_skips_sentinel_scan_br9a(monkeypatch: pytest.MonkeyPatch):
+    """BR-9a: a sentinel printed then nonzero exit yields output=null (scan skipped)."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    proc = _FakeProcess(
+        exit_rc=2, stdout=b'CAO_WORKFLOW_OUTPUT:{"leaked": true}\n', stderr=b"then crash"
+    )
+    _install_fake_spawn(monkeypatch, proc)
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash-sentinel")
+    assert result.state == RunState.FAILED
+    assert result.output is None  # sentinel NOT surfaced on a failed run
+
+
+@pytest.mark.asyncio
+async def test_hang_timeout_reap_bumps_generation(monkeypatch: pytest.MonkeyPatch):
+    """Hang -> TimeoutBound -> _terminate -> FAILED,kind=timeout; gen bumped (INV-6)."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    # Tiny bound so the reaper fires fast in the test.
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.05)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _FakeProcess(exit_rc=0, hang=True)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-hang")
+    assert result.state == RunState.FAILED
+    assert result.kind == "timeout"
+    assert "SIGTERM" in proc.signals  # _terminate escalated
+    # Generation bumped + persisted on the timeout arm (INV-6, the straggler fence).
+    row = workflow_journal.get_run("run-hang")
+    assert row is not None and row.generation == "2"
+    # F10d: the wall-clock timeout marker is surfaced in warnings for observability.
+    assert any("[wall-clock timeout]" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_timeout_with_pipes_held_open_settles_and_closes_them(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A timed-out script whose pipes a process it started still holds settles as a timeout.
+
+    The timeout arm cancels the readers, so it has to close the pipes as well,
+    or that process blocks on its next write once the buffer fills.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.1)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-timeout-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "timeout"
+    assert proc.signals == ["SIGTERM"]
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_timeout_bound_helper_raises():
+    """_await_exit_within_bound converts the elapsed bound into TimeoutBound."""
+    proc = _FakeProcess(exit_rc=0, hang=True)
+    with pytest.raises(TimeoutBound):
+        await script_runner._await_exit_within_bound(proc, timeout=0.02)
+
+
+# ---------------------------------------------------------------------------
+# A4 — _terminate escalation (F7, Important #2)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_terminate_escalates_to_sigkill_when_uncooperative():
+    """An uncooperative child (ignores SIGTERM) is escalated to SIGKILL and reaped."""
+    proc = _FakeProcess(exit_rc=0, hang=True, uncooperative=True)
+    await script_runner._terminate(proc, grace=0.05)
+    assert proc.signals == ["SIGTERM", "SIGKILL"]
+    assert proc.returncode == -9  # reaped after kill()
+
+
+@pytest.mark.asyncio
+async def test_terminate_cooperative_never_escalates():
+    """A cooperative child settles on SIGTERM alone — kill() is never called."""
+    proc = _FakeProcess(exit_rc=0, hang=True)
+    await script_runner._terminate(proc, grace=0.05)
+    assert proc.signals == ["SIGTERM"]
+    assert proc.returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("honours_sigterm", "signals", "rc"),
+    [(True, ["SIGTERM"], -15), (False, ["SIGTERM", "SIGKILL"], -9)],
+    ids=["honours-sigterm", "ignores-sigterm"],
+)
+async def test_terminate_settles_on_exit_while_pipes_are_held(
+    monkeypatch: pytest.MonkeyPatch, honours_sigterm: bool, signals: List[str], rc: int
+):
+    """_terminate returns once the script exits, even if a process it started holds the pipes.
+
+    From 3.11 ``wait()`` waits for pipe EOF too, so a ``wait()`` after SIGKILL
+    could block for as long as that process lived, and so could cancel. The
+    poll interval is stretched past the grace so a SIGTERM exit is only seen
+    after the grace elapses, and must still not be followed by SIGKILL.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(
+        wait_holds_for_pipes=True, exit_after=None, honours_sigterm=honours_sigterm
+    )
+    await asyncio.wait_for(script_runner._terminate(proc, grace=0.05), timeout=2.0)
+    assert proc.signals == signals
+    assert proc.returncode == rc
+
+
+@pytest.mark.asyncio
+async def test_terminate_does_not_spend_the_grace_after_a_sigterm_exit():
+    """A script that exits on SIGTERM is reaped then, not when the grace runs out."""
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    await asyncio.wait_for(script_runner._terminate(proc, grace=5.0), timeout=1.0)
+    assert proc.signals == ["SIGTERM"]
+    assert proc.returncode == -15
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_returns_failed_never_raises(monkeypatch: pytest.MonkeyPatch):
+    """F4: a spawn-time OSError is caught -> FAILED,kind=error; never raises.
+
+    Module contract: only the lint gate and admission gates raise out of U4 —
+    a spawn failure (e.g. the interpreter vanished) is a run failure, not an
+    engine invariant violation.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+
+    async def _boom_exec(*a, **k):
+        raise FileNotFoundError("no such file: python3")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.script_runner.asyncio.create_subprocess_exec",
+        _boom_exec,
+    )
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-spawn-fail")
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("spawn failed" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_chatty_child_no_deadlock(monkeypatch: pytest.MonkeyPatch):
+    """M2: a child writing > 1 MiB to stdout drains concurrently without deadlock."""
+    big = b"x" * (1024 * 1024 + 500) + b'\nCAO_WORKFLOW_OUTPUT:{"done": true}\n'
+    proc = _FakeProcess(exit_rc=0, stdout=big)
+    _install_fake_spawn(monkeypatch, proc)
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-chatty"), timeout=5.0
+    )
+    assert result.state == RunState.COMPLETED
+    # The sentinel is in the tail, so it survives the ring-buffer cap.
+    assert result.output == {"done": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_exit_with_pipes_held_open_completes(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A script that exits 0 while a process it started keeps stdout open completes.
+
+    Before the fix, the 3.11+ ``wait()`` shape ran out the wall-clock bound and
+    settled FAILED,kind=timeout with the output dropped, and the 3.10 shape
+    blocked in the unbounded drain for as long as the pipes stayed open.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=wait_holds_for_pipes
+    )
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.COMPLETED
+    assert result.kind is None
+    assert result.output == {"ok": True}
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []  # an exited script is never signalled
+    assert proc._transport.closed  # the held pipes are not left open in the server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_nonzero_exit_with_pipes_held_open_fails_with_warning(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A nonzero exit with the pipes held open settles FAILED,kind=error, not timeout."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(stderr=b"boom\n", wait_holds_for_pipes=wait_holds_for_pipes, exit_rc=3)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-rc3"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_is_logged_and_not_reported_as_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Without ``_transport`` the run still settles, and nothing claims the pipes were closed."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=True
+    )
+    del proc._transport
+    _install_fake_spawn(monkeypatch, proc)
+
+    with caplog.at_level(logging.WARNING, logger=script_runner.__name__):
+        result = await asyncio.wait_for(
+            run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-no-transport"), timeout=5.0
+        )
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    assert any("could not be closed" in w for w in result.warnings)
+    assert not any("were closed" in w for w in result.warnings)
+    assert any("has no _transport" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_close_pipes_closes_a_real_process_transport():
+    """``_close_pipes`` reaches the transport of a real ``asyncio.subprocess.Process``.
+
+    Every other test here hands the drive a fake with a ``_FakeTransport``, so
+    they would keep passing if a Python release renamed the private attribute.
+    asyncio closes the transport on its own once the child has exited and both
+    pipes reach EOF, so the child starts a process that holds them, as a script
+    that backgrounds something does.
+    """
+    holder_code = "import time; time.sleep(30)"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-c', {holder_code!r}]); "
+        "print(p.pid, flush=True)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    holder_pid = int(await asyncio.wait_for(proc.stdout.readline(), timeout=10.0))
+    try:
+        for _ in range(500):
+            if proc.returncode is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert proc.returncode == 0
+        assert not proc._transport.is_closing()  # the holder keeps both pipes open
+
+        assert script_runner._close_pipes(proc) is True
+        assert proc._transport.is_closing()
+    finally:
+        try:
+            os.kill(holder_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exit_just_before_the_bound_is_not_a_timeout(monkeypatch: pytest.MonkeyPatch):
+    """An exit asyncio recorded before the bound elapsed is not reported as a timeout.
+
+    The poll interval is stretched past the bound so the exit lands while
+    ``_wait_for_exit`` is between two ``returncode`` checks.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=0.05)
+
+    await script_runner._await_exit_within_bound(proc, timeout=0.3)
+    assert proc.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# A3 — cancel_script_run
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_cancel_signal_first_order(monkeypatch: pytest.MonkeyPatch):
+    """Signal-first order: gen bump -> terminate -> sweep -> journal CANCELLED."""
+    order: List[str] = []
+
+    async def _fake_sweep(run_id):
+        order.append("sweep")
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
+    proc = _FakeProcess(exit_rc=0)
+
+    orig_terminate = script_runner._terminate
+
+    async def _tracked_terminate(process, grace):
+        order.append("terminate")
+        await orig_terminate(process, grace)
+
+    monkeypatch.setattr(script_runner, "_terminate", _tracked_terminate)
+
+    _seed_script_run("run-cancel", generation="1")
+    record = _make_record("run-cancel", process=proc, generation="1")
+
+    await cancel_script_run(record)
+    assert order == ["terminate", "sweep"]
+    assert record.state == RunState.CANCELLED
+    assert record.finished_at is not None
+    # Generation bumped + persisted (DR-11) BEFORE terminate.
+    row = workflow_journal.get_run("run-cancel")
+    assert row is not None and row.generation == "2"
+    assert row.state == "cancelled"  # retained -> resumable for scripts
+
+
+@pytest.mark.asyncio
+async def test_cancel_drive_race_drive_yields_to_cancelled(monkeypatch: pytest.MonkeyPatch):
+    """F2: cancel wins a race with the drive's own exit interpretation.
+
+    A cancel signals the process; the process then "exits" (rc != 0, as an
+    unrelated SIGTERM-adjacent death would look). ``_drive_process`` must check
+    ``record.cancelled`` BEFORE interpreting ``rc`` and defer to the CANCELLED
+    result cancel_script_run already journaled — never overwrite it with
+    FAILED.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    proc = _FakeProcess(exit_rc=1)  # would-be FAILED if cancel had not already fired
+    _install_fake_spawn(monkeypatch, proc)
+
+    _seed_script_run("run-race", generation="1")
+    record = _make_record("run-race", process=None, generation="1")
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-race"] = record
+    env = script_runner._build_env("run-race", "1")
+
+    async def _cancel_mid_flight():
+        # Simulate cancel_script_run having already fired: signal + journal
+        # CANCELLED, set the flag the drive must respect.
+        record.cancelled = True
+        record.state = RunState.CANCELLED
+        record.finished_at = script_runner._now()
+        await asyncio.to_thread(
+            workflow_journal.update_run_state,
+            "run-race",
+            RunState.CANCELLED.value,
+            record.finished_at,
+        )
+
+    await _cancel_mid_flight()
+    result = await script_runner._drive_process(record, "/tmp/wf.py", env)
+
+    assert result.state == RunState.CANCELLED
+    assert result.kind == "cancelled"
+    row = workflow_journal.get_run("run-race")
+    assert row is not None and row.state == "cancelled"  # drive did not overwrite it
+
+
+@pytest.mark.asyncio
+async def test_cancel_idempotent_second_is_noop(monkeypatch: pytest.MonkeyPatch):
+    """BR-19: a second cancel on an already-cancelling record is a logged no-op."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    _seed_script_run("run-cancel2", generation="1")
+    record = _make_record("run-cancel2", process=_FakeProcess(), generation="1")
+    record.cancelled = True  # already cancelling
+    await cancel_script_run(record)
+    # No generation bump happened (the guard returned before step 1).
+    row = workflow_journal.get_run("run-cancel2")
+    assert row is not None and row.generation == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state", [RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]
+)
+async def test_cancel_terminal_record_is_service_noop(
+    monkeypatch: pytest.MonkeyPatch, terminal_state: RunState
+):
+    """Direct callers cannot rewrite a retained terminal record to CANCELLED."""
+
+    async def _must_not_sweep(run_id):
+        raise AssertionError("terminal run must return before cancellation work")
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _must_not_sweep)
+    _seed_script_run("run-terminal", state=terminal_state.value, generation="1")
+    process = _FakeProcess()
+    record = _make_record("run-terminal", process=process, generation="1")
+    record.state = terminal_state
+    record.finished_at = "2026-07-08T00:00:01Z"
+
+    await cancel_script_run(record)
+
+    row = workflow_journal.get_run("run-terminal")
+    assert row is not None and row.state == terminal_state.value
+    assert row.generation == "1"
+    assert record.state == terminal_state
+    assert record.cancelled is False
+    assert process.signals == []
+
+
+# ---------------------------------------------------------------------------
+# A2 — resume admission + happy path
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_resume_absent_run_raises_keyerror():
+    with pytest.raises(KeyError):
+        await resume_script_run("nope")
+
+
+@pytest.mark.asyncio
+async def test_resume_live_run_raises_not_allowed(monkeypatch: pytest.MonkeyPatch):
+    """Gate 2: a run made live through the REAL drive path -> ResumeNotAllowedError.
+
+    Regression for b4c1 (double-drive): liveness must be established by the actual
+    ``run_script_workflow`` drive registering into ``_active_drives`` — NOT by
+    hand-seeding set membership. We spawn a never-exiting (hang) process so the
+    run stays mid-drive, wait until the drive marks itself live, then attempt a
+    concurrent resume and assert the 409. Finally we release the process so the
+    drive task settles and clears the liveness mark.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    # Admission freezing is covered separately; avoid timing this liveness proof
+    # against filesystem/profile discovery before the drive starts.
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kw: None)(**kwargs)
+        ),
+    )
+    proc = _FakeProcess(exit_rc=0, hang=True)
+    _install_fake_spawn(monkeypatch, proc)
+
+    drive = asyncio.create_task(run_script_workflow(_FakeScriptSpec(), {}, "run-live"))
+    try:
+        # Wait for the real drive path to register liveness (never hand-seeded).
+        for _ in range(200):
+            if "run-live" in workflow_service._active_drives:
+                break
+            await asyncio.sleep(0.005)
+        assert "run-live" in workflow_service._active_drives  # established by the drive
+
+        with pytest.raises(ResumeNotAllowedError):
+            await resume_script_run("run-live")
+    finally:
+        # Release the hang so the drive task finalizes and clears the mark.
+        proc.terminate()
+        await asyncio.wait_for(drive, timeout=5.0)
+    assert "run-live" not in workflow_service._active_drives  # cleared on drive exit
+
+
+@pytest.mark.asyncio
+async def test_resume_toctou_second_concurrent_resume_rejected(monkeypatch: pytest.MonkeyPatch):
+    """F5: a second concurrent resume is fenced even while the first is pre-spawn.
+
+    Without marking ``_active_drives`` immediately after Gate 2, two resumes for
+    the same run_id could both pass Gate 2 before either registers liveness (a
+    TOCTOU double-drive). We block the FIRST resume inside a patched
+    ``update_run_generation`` (after Gate 2 passes, before spawn — it runs via
+    ``asyncio.to_thread``, so blocking with a plain ``threading.Event`` does not
+    freeze the event loop) and assert a SECOND concurrent resume attempt hits
+    Gate 2 and gets ``ResumeNotAllowedError`` while the first is still blocked.
+    """
+    import threading
+
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.workflow_service import update_run_generation
+
+    _seed_script_run("run-toctou", state="failed", generation="1")
+
+    first_blocked = threading.Event()
+    release_first = threading.Event()
+
+    def _blocking_update_run_generation(run_id, generation):
+        first_blocked.set()
+        release_first.wait(timeout=5.0)
+        return update_run_generation(run_id, generation)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_service.update_run_generation",
+        _blocking_update_run_generation,
+    )
+
+    first = asyncio.create_task(resume_script_run("run-toctou"))
+    try:
+        for _ in range(500):
+            if first_blocked.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert first_blocked.is_set()
+        # The first resume passed Gate 2 and is now blocked pre-spawn — it must
+        # already be marked live so a second concurrent resume is fenced.
+        assert "run-toctou" in workflow_service._active_drives
+        with pytest.raises(ResumeNotAllowedError):
+            await resume_script_run("run-toctou")
+    finally:
+        release_first.set()
+        # Let the first resume's drive (real spawn, mocked below) settle.
+        proc = _FakeProcess(exit_rc=0)
+        _install_fake_spawn(monkeypatch, proc)
+        await asyncio.wait_for(first, timeout=5.0)
+    assert "run-toctou" not in workflow_service._active_drives
+
+
+@pytest.mark.asyncio
+async def test_resume_traversal_run_id_rejected_no_file_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """B2: a traversal run_id is rejected (ValueError) before any path/exec use.
+
+    A run_id like ``../../../tmp/evil`` must never reach ``_materialize_snapshot``
+    where it would compose ``scratch/resume-{run_id}.py`` and get exec'd (arbitrary
+    file write + code exec). The shared key validator rejects it at the top of
+    ``resume_script_run`` — no snapshot file is created anywhere.
+    """
+    # Point the scratch root at an empty temp dir so we can assert nothing landed.
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch, raising=True)
+
+    async def _boom_spawn(*a, **k):  # pragma: no cover — must never be reached
+        raise AssertionError("spawn must not happen on a traversal run_id")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.script_runner.asyncio.create_subprocess_exec",
+        _boom_spawn,
+    )
+
+    evil = "../../../tmp/evil"
+    with pytest.raises(ValueError):
+        await resume_script_run(evil)
+
+    # No file was written outside (or inside) the scratch root — validation fired
+    # before materialize, so the traversal target never exists.
+    assert not (tmp_path / "tmp" / "evil").exists()
+    assert not (Path("/tmp") / "evil.py").exists()
+    if scratch.exists():
+        assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_resume_completed_run_not_resumable():
+    """Gate 3: a COMPLETED run is terminal -> ResumeNotAllowedError (409)."""
+    _seed_script_run("run-done", state="completed", generation="1")
+    with pytest.raises(ResumeNotAllowedError):
+        await resume_script_run("run-done")
+
+
+@pytest.mark.asyncio
+async def test_resume_corrupt_snapshot_raises_corrupt():
+    """Gate 4: a spec_snapshot with no source -> ResumeCorruptError (422)."""
+    workflow_journal.insert_run(
+        run_id="run-corrupt",
+        workflow_name="wf",
+        spec_snapshot="{not valid json",
+        inputs_json="{}",
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="1",
+    )
+    with pytest.raises(ResumeCorruptError):
+        await resume_script_run("run-corrupt")
+
+
+@pytest.mark.asyncio
+async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.MonkeyPatch):
+    """A FAILED script run resumes: bump+persist gen, exec a temp file, delete it."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    source = "print('resumed')\n"
+    workflow_journal.insert_run(
+        run_id="run-resume",
+        workflow_name="wf",
+        spec_snapshot=json.dumps(
+            {"source": source, "path": "/tmp/wf.py", "working_directory": "/recorded/root"}
+        ),
+        inputs_json="{}",
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="3",
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-resume")
+    assert result.state == RunState.COMPLETED
+    # Generation bumped BEFORE spawn and persisted (INV-6): 3 -> 4.
+    row = workflow_journal.get_run("run-resume")
+    assert row is not None and row.generation == "4"
+    # Resume env carries CAO_WORKFLOW_RESUME=1 + the bumped generation.
+    env = captured["env"]
+    assert env["CAO_WORKFLOW_RESUME"] == "1"
+    assert env["CAO_WORKFLOW_GENERATION"] == "4"
+    assert captured["cwd"] == "/recorded/root"
+    assert script_runner.run_registry["run-resume"].working_directory == "/recorded/root"
+    # The exec'd path is the engine-owned materialized temp file, NOT the on-disk
+    # author file — and it is deleted in the finally after reap (BR-30).
+    exec_path = captured["args"][1]
+    assert exec_path.endswith("resume-run-resume.py")
+    assert not Path(exec_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_reads_inputs_json_and_delivers_verbatim(monkeypatch: pytest.MonkeyPatch):
+    """FR-A6/REL-A1: resume reads the journaled inputs_json and delivers it to
+    _build_env VERBATIM (byte-identical replay), with NO re-validation."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    # The journaled RESOLVED map from the original run.
+    journaled = {"topic": "birds", "count": 3}
+    workflow_journal.insert_run(
+        run_id="run-inputs",
+        workflow_name="wf",
+        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        inputs_json=json.dumps(journaled),
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="1",
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-inputs")
+    assert result.state == RunState.COMPLETED
+    # The re-delivered CAO_WORKFLOW_INPUTS is the SAME bytes _build_env would emit
+    # for the journaled map — deterministic replay (compact json.dumps).
+    env = captured["env"]
+    assert env["CAO_WORKFLOW_INPUTS"] == json.dumps(journaled, separators=(",", ":"))
+    assert env["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_resume_malformed_inputs_json_degrades_to_empty(monkeypatch: pytest.MonkeyPatch):
+    """A corrupt inputs_json degrades to {} on resume (delivers what it can),
+    never aborting the resume — the snapshot source is still valid."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    workflow_journal.insert_run(
+        run_id="run-badinputs",
+        workflow_name="wf",
+        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        inputs_json="[not, a, dict]",  # non-object -> degrade to {}
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="1",
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-badinputs")
+    assert result.state == RunState.COMPLETED
+    assert captured["env"]["CAO_WORKFLOW_INPUTS"] == "{}"
+
+
+# ---------------------------------------------------------------------------
+# Resume gate 7 — the working-directory root is still the approved one
+# (#827 criterion 2, "a running OR RESUMED script run"; ask 3 on PR #1051)
+# ---------------------------------------------------------------------------
+
+
+def _resumable_run_bound_to(monkeypatch, tmp_path, run_id: str, root) -> None:
+    """Seed a resumable, APPROVED script run whose admission record binds ``root``'s real identity.
+
+    Approval enforcement is turned back ON for these tests (the module fixture turns it off), because
+    gate 7 only applies while it is on -- and it is turned on through the real setting, so the
+    predicate under test is the production one.
+    """
+    from cli_agent_orchestrator.services import (
+        approval_store,
+        launch_guard,
+        manifest_freeze,
+        settings_service,
+    )
+    from cli_agent_orchestrator.utils import git_baseline
+
+    assert git_baseline.derive_baseline(str(root)).get("repository") is False, (
+        "fixture assumption broken: this root must be outside Git so its recorded identity is the "
+        "device/inode pair rather than a commit"
+    )
+    settings_service.SETTINGS_FILE.write_text(json.dumps({"workflow": {"require_approval": True}}))
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+    assert frozen.root_identity is not None and frozen.root_identity["bound"] is True
+    guard = launch_guard.capture(profile_set=frozen.profile_set, root_identity=frozen.root_identity)
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot=json.dumps(
+            {
+                "source": "print('resumed')\n",
+                "path": "/tmp/wf.py",
+                "working_directory": str(root),
+                "launch_guard": guard,
+            }
+        ),
+        inputs_json="{}",
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="3",
+        manifest_json=frozen.manifest_json,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_with_a_replaced_root_is_refused_before_anything_is_bumped(
+    monkeypatch, tmp_path
+):
+    """THE DEFECT ask 3 names. Nothing compared the root at resume, so nothing refused this.
+
+    The first root comparison lived in ``run_agent_step``, which a RESUME reaches only when it starts
+    a NEW agent step. So a resume into a replacement directory ran the script code before that step
+    there, and a resume whose remaining agent steps are ALL REPLAYS ran to completion there -- a
+    replayed step returns before ``run_agent_step`` is ever called.
+
+    Gate 6 above cannot catch it: it compares the ``plan_id`` already frozen on the row and never
+    recomputes it, so the replaced root's pair is in the identifier the resume REUSES.
+
+    The refusal must also leave nothing behind, which is why the generation and the spawn are both
+    asserted: the bump fences out any still-live process for this run, so bumping and then refusing
+    would kill a possibly-healthy run on behalf of a resume that was itself rejected.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    root = tmp_path / "work"
+    root.mkdir()
+    _resumable_run_bound_to(monkeypatch, tmp_path, "run-root-swapped", root)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+
+    from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
+
+    with pytest.raises(PlanInputsChangedError, match="path is unchanged"):
+        await resume_script_run("run-root-swapped")
+
+    row = workflow_journal.get_run("run-root-swapped")
+    assert row is not None and row.generation == "3", (
+        "the generation was bumped by a resume that was then refused, fencing out any still-live "
+        "process for this run"
+    )
+    assert spawned == {}, "a refused resume spawned the script anyway"
+    assert "run-root-swapped" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+async def test_resume_with_the_root_intact_is_unchanged(monkeypatch, tmp_path):
+    """The false-positive direction. Gate 7 must be invisible to every ordinary resume.
+
+    A gate that refused a resume whose directory never moved would be worse than the hole it closes:
+    the operator cannot restore an identity that was never lost, and the run is not resumable by any
+    other route.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    root = tmp_path / "work"
+    root.mkdir()
+    _resumable_run_bound_to(monkeypatch, tmp_path, "run-root-intact", root)
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-root-intact")
+
+    assert result.state == RunState.COMPLETED
+    row = workflow_journal.get_run("run-root-intact")
+    assert row is not None and row.generation == "4"
+    assert captured["cwd"] == str(root)
+    assert captured["env"]["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_resume_of_a_record_written_before_the_root_binding_is_not_refused(
+    monkeypatch, tmp_path
+):
+    """Gate 7 carries the SAME migration posture as the launch guard, because it is the same code.
+
+    A ``launch-guard-v2`` record frozen before the root binding has no ``root_identity`` key, and a
+    Git-root record from before ask 2 has ``None``. Either must resume: those runs are resumable by
+    design (resume reuses the frozen ``plan_id``), and refusing them for a pair they never recorded
+    would strand every in-flight run at the upgrade. Two spellings of the comparison would be where
+    that posture drifts, which is why resume calls ``_check_root_identity`` rather than restating it.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    root = tmp_path / "work"
+    root.mkdir()
+    _resumable_run_bound_to(monkeypatch, tmp_path, "run-pre-binding", root)
+    row = workflow_journal.get_run("run-pre-binding")
+    assert row is not None
+    snapshot = json.loads(row.spec_snapshot)
+    del snapshot["launch_guard"]["root_identity"]
+    workflow_journal.insert_run(
+        run_id="run-pre-binding-2",
+        workflow_name="wf",
+        spec_snapshot=json.dumps(snapshot),
+        inputs_json="{}",
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="3",
+        manifest_json=row.manifest_json,
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    _install_fake_spawn(monkeypatch, proc)
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+
+    result = await resume_script_run("run-pre-binding-2")
+    assert result.state == RunState.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# A5 — orphan sweep off the in-memory step_states (BR-31 5b)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_orphan_sweep_tears_down_in_flight_terminals(monkeypatch: pytest.MonkeyPatch):
+    """In-flight step terminals are torn down; a terminal step is left alone."""
+    deleted: List[str] = []
+    reasons: List[str] = []
+
+    def _fake_delete(terminal_id, registry=None, *, end_reason):
+        deleted.append(terminal_id)
+        reasons.append(end_reason)
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal", _fake_delete
+    )
+    record = _make_record("run-sweep", process=None, generation="1")
+    record.step_states = {
+        "s1": StepRunState(step_id="s1", state=StepState.RUNNING, terminal_id="term-1"),
+        "s2": StepRunState(step_id="s2", state=StepState.COMPLETED, terminal_id="term-2"),
+        "s3": StepRunState(step_id="s3", state=StepState.RUNNING, terminal_id=None),
+    }
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-sweep"] = record
+
+    await script_runner._reconcile_orphans("run-sweep")
+    # Only s1 (in-flight + has a terminal) is torn down.
+    assert deleted == ["term-1"]
+    # Issue #1082: an orphan sweep ends the launch as a stale cleanup.
+    assert reasons == ["stale_cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_teardown_failure_never_raises(monkeypatch: pytest.MonkeyPatch):
+    """INV-4: a teardown failure is logged, never raised into the drive path."""
+
+    def _boom_delete(terminal_id, registry=None, *, end_reason):
+        raise RuntimeError("terminal already gone")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal", _boom_delete
+    )
+    record = _make_record("run-sweep-fail", process=None, generation="1")
+    record.step_states = {
+        "s1": StepRunState(step_id="s1", state=StepState.RUNNING, terminal_id="term-x"),
+    }
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-sweep-fail"] = record
+    # Must not raise.
+    await script_runner._reconcile_orphans("run-sweep-fail")
+    # F10c: the swallowed teardown failure leaves the record's in-flight step
+    # untouched — the sweep never mutates state on a failure, it only logs.
+    assert record.step_states["s1"].state == StepState.RUNNING
+    assert record.step_states["s1"].terminal_id == "term-x"
+
+
+# ---------------------------------------------------------------------------
+# BR-31 terminal recorder wiring
+# ---------------------------------------------------------------------------
+def test_terminal_recorder_none_without_script_record():
+    """No live ScriptRunRecord -> no recorder (YAML/handoff callers unaffected)."""
+    assert make_step_terminal_recorder(None) is None
+    assert make_step_terminal_recorder({"CAO_WORKFLOW_RUN_ID": "x"}) is None  # no step id
+    # run/step present but no record in the registry.
+    assert (
+        make_step_terminal_recorder({"CAO_WORKFLOW_RUN_ID": "ghost", "CAO_WORKFLOW_STEP_ID": "s1"})
+        is None
+    )
+
+
+def test_terminal_recorder_records_into_step_states():
+    """The recorder writes terminal_id into the shared record's step_states (BR-31).
+
+    F9(a) new-StepRunState branch: no ``step_states[step_id]`` entry exists yet,
+    so the recorder creates one (RUNNING) before writing ``terminal_id``.
+    """
+    record = _make_record("run-rec", process=None, generation="1")
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-rec"] = record
+    recorder = make_step_terminal_recorder(
+        {"CAO_WORKFLOW_RUN_ID": "run-rec", "CAO_WORKFLOW_STEP_ID": "s1"}
+    )
+    assert recorder is not None
+    recorder("term-created", "v2:" + "0" * 64)
+    assert record.step_states["s1"].terminal_id == "term-created"
+    assert record.step_states["s1"].state == StepState.RUNNING
+
+
+def test_terminal_recorder_updates_already_present_step_state():
+    """F9(a) already-present branch: an existing StepRunState's terminal_id is
+    overwritten rather than the entry being replaced."""
+    record = _make_record("run-rec2", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(
+        step_id="s1", state=StepState.RUNNING, attempts=2, terminal_id="term-old"
+    )
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-rec2"] = record
+    recorder = make_step_terminal_recorder(
+        {"CAO_WORKFLOW_RUN_ID": "run-rec2", "CAO_WORKFLOW_STEP_ID": "s1"}
+    )
+    assert recorder is not None
+    recorder("term-new", "v2:" + "0" * 64)
+    assert record.step_states["s1"].terminal_id == "term-new"
+    assert record.step_states["s1"].attempts == 2  # untouched, only terminal_id updates
+
+
+def test_terminal_recorder_none_for_non_script_record():
+    """F9(c) a live but non-``ScriptRunRecord`` (YAML tier) registry entry -> None."""
+    from cli_agent_orchestrator.models.workflow import WorkflowSpec
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.workflow_service import RunRecord
+
+    yaml_record = RunRecord(
+        run_id="run-yaml",
+        workflow_name="wf",
+        spec=WorkflowSpec.model_validate(
+            {
+                "name": "wf",
+                "version": "1",
+                "mode": "sequential",
+                "steps": [
+                    {"id": "s1", "provider": "kiro_cli", "agent": "developer", "prompt": "do it"}
+                ],
+            }
+        ),
+        inputs={},
+        state=RunState.RUNNING,
+        cancelled=False,
+        current_step_id=None,
+        step_states={},
+        started_at="2026-07-08T00:00:00Z",
+        finished_at=None,
+    )
+    workflow_service.run_registry["run-yaml"] = yaml_record
+    assert (
+        make_step_terminal_recorder(
+            {"CAO_WORKFLOW_RUN_ID": "run-yaml", "CAO_WORKFLOW_STEP_ID": "s1"}
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — record_step_completion (RUNNING -> COMPLETED/FAILED transition)
+# ---------------------------------------------------------------------------
+def _kw(run_id: str, step_id: str) -> dict:
+    """The run/step env a genuine script run-step call carries."""
+    return {"CAO_WORKFLOW_RUN_ID": run_id, "CAO_WORKFLOW_STEP_ID": step_id}
+
+
+# ``test_step_call_fingerprint_stable_and_field_separated`` lived here until issue #583's
+# ``step-fingerprint`` unit DELETED ``_step_call_fingerprint`` (BR-10/INV-7: two fingerprint
+# functions in one codebase is the defect FR-2 exists to prevent). Its two properties —
+# determinism and NUL field-boundary separation — are now asserted against the replacement in
+# ``test_step_fingerprint.py::TestReturnedForm``, and the journal round-trip it pinned is
+# preserved below in ``test_completion_transitions_running_to_completed``.
+
+
+def test_completion_guard_none_without_script_record():
+    """Same BR-31 guard as the recorder: no run/step env or no live script
+    record -> None (YAML/handoff callers untouched)."""
+    assert record_step_completion(None) is None
+    assert record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}) is None
+    # run/step present but no record in the registry.
+    assert record_step_completion(_kw("ghost", "s1")) is None
+
+
+def test_completion_transitions_running_to_completed(_patched_journal):
+    """Happy path: a settle with no error flips a seeded RUNNING step to COMPLETED,
+    bumps attempts, and journals the completed row (so resume can replay it)."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-c", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(
+        step_id="s1", state=StepState.RUNNING, terminal_id="term-1"
+    )
+    workflow_service.run_registry["run-c"] = record
+
+    settle = record_step_completion(_kw("run-c", "s1"))
+    assert settle is not None
+    settle("term-1", None, "the answer")
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.COMPLETED
+    assert st.attempts == 1
+    assert st.error is None
+    # The completed step is written through to the journal with its attempts
+    # persisted (so a resume's lookup_replay / rebuild sees the real state).
+    row = workflow_journal.get_step("run-c", "s1")
+    assert row is not None
+    assert row.state == "completed"
+    assert row.attempts == 1
+    # Issue #583's ``settlement-rewire``: one ``settle_step`` write, which carries the result
+    # envelope and NEVER the fingerprint (unit 6 BR-9 — ``begin_step`` owns that column). This
+    # test drives the settle callback directly with no preceding ``begin_step``, so the row is
+    # the documented no-begin RESCUE: settled, with absent provenance.
+    assert row.call_fingerprint is None
+    assert row.result_json is not None
+    assert json.loads(row.result_json)["last_message"] == "the answer"
+
+
+def test_completion_adopts_validated_structured_output(_patched_journal):
+    """A worker that returned schema-valid output via workflow_return has that
+    output copied onto the step state and settles COMPLETED."""
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+    record = _make_record("run-out", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-out"] = record
+    # Worker emitted a valid output (no schema -> validated=True).
+    record_step_output("run-out", "s1", {"answer": 42})
+
+    settle = record_step_completion(_kw("run-out", "s1"))
+    settle("term-1", None, "done")
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.COMPLETED
+    assert st.output is not None and st.output.output == {"answer": 42}
+    # The structured output round-trips to the durable row (not NULL), preserving
+    # complete status history and the reserved lookup_replay primitive's data.
+    row = workflow_journal.get_step("run-out", "s1")
+    assert row is not None and row.output_json is not None
+    assert json.loads(row.output_json) == {"answer": 42}
+
+
+def test_completion_unvalidated_output_settles_completed_unvalidated(_patched_journal):
+    """Edge case: a present-but-schema-invalid output settles
+    COMPLETED_UNVALIDATED (missing==invalid), mirroring the YAML tier."""
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+    record = _make_record("run-inv", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-inv"] = record
+    # Output fails its schema -> validated=False, state COMPLETED_UNVALIDATED.
+    record_step_output(
+        "run-inv",
+        "s1",
+        {"answer": "not-an-int"},
+        {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]},
+    )
+
+    settle = record_step_completion(_kw("run-inv", "s1"))
+    settle("term-1", None, "done")
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.COMPLETED_UNVALIDATED
+    assert st.output is not None and st.output.validated is False
+
+
+def test_completion_error_transitions_running_to_failed(_patched_journal):
+    """Edge case: a settle carrying an error flips the step to FAILED, records the
+    error string, and journals FAILED."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-f", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-f"] = record
+
+    settle = record_step_completion(_kw("run-f", "s1"))
+    settle("term-1", "terminal term-1 reached ERROR status", None)
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.FAILED
+    assert st.error == "terminal term-1 reached ERROR status"
+    row = workflow_journal.get_step("run-f", "s1")
+    assert row is not None and row.state == "failed"
+    # The error string persists durably (append_step hardcodes error=NULL; the
+    # update_step second write is what carries it).
+    assert row.error == "terminal term-1 reached ERROR status"
+
+
+def test_completion_creates_step_state_when_missing(_patched_journal):
+    """Edge case: if no prior RUNNING seed exists (the terminal-created callback
+    never fired), the settle still records the transition rather than KeyError-ing."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-m", process=None, generation="1")  # empty step_states
+    workflow_service.run_registry["run-m"] = record
+
+    settle = record_step_completion(_kw("run-m", "s1"))
+    settle(None, None, "done")
+
+    assert "s1" in record.step_states
+    assert record.step_states["s1"].state == StepState.COMPLETED
+    assert record.step_states["s1"].attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caught_kind", "caught_error"),
+    (
+        ("provider_error", "provider error (api_error)"),
+        ("timeout", "readiness timeout while waiting for terminal"),
+    ),
+)
+async def test_caught_step_kind_does_not_override_unrelated_run_failure(
+    _patched_journal, caught_kind, caught_error
+):
+    """A script may catch a typed step failure and later exit for another reason.
+
+    The live terminal kind is ``error`` because the subprocess failed; the cold
+    result must retain that run-level verdict even though the durable step still
+    carries the kind it caught as diagnostic data.
+    """
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = f"run-caught-{caught_kind}"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-caught", caught_error, None, None, caught_kind)
+
+    result = await script_runner._finalize(
+        record,
+        state=RunState.FAILED,
+        kind="error",
+        error="unrelated author-side failure",
+    )
+
+    assert result.kind == "error"
+    row = workflow_journal.get_run(run_id)
+    assert row is not None and row.kind == "error"
+    steps = workflow_journal.get_steps(run_id)
+    assert steps[0].error_kind == caught_kind
+    assert _resolve_error_kind(row, steps) == "error"
+
+
+@pytest.mark.asyncio
+async def test_script_result_preserves_provider_error_kind(_patched_journal):
+    """The final script ``WorkflowRunResult`` carries the settled structured kind."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = "run-provider-result"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-provider", "provider error (api_error)", None, None, "provider_error")
+
+    result = await script_runner._finalize(
+        record, state=RunState.FAILED, kind="provider_error", error="provider error"
+    )
+
+    assert len(result.steps) == 1
+    assert result.steps[0].state == StepState.FAILED
+    assert result.steps[0].error_kind == "provider_error"
+    assert record.step_states["s1"].attempts == 1
+
+
+def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
+    """INV-4: a journal write failure during settle is swallowed — the in-memory
+    transition still lands, the call never raises."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-j", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-j"] = record
+
+    def _boom(*a, **k):
+        raise RuntimeError("db gone")
+
+    monkeypatch.setattr(workflow_journal, "settle_step", _boom)
+
+    settle = record_step_completion(_kw("run-j", "s1"))
+    settle("term-1", None, "done")  # must not raise
+    # In-memory transition still applied despite the journal write failing.
+    assert record.step_states["s1"].state == StepState.COMPLETED
+
+
+def test_get_run_status_script_cold_miss_uses_journal_row_without_yaml_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A journal-only script run returns its row state and no reconstructed steps."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    _seed_script_run("run-cold", state="failed", generation="3")
+
+    def _must_not_rebuild(run_id):
+        raise AssertionError("script status must not use the YAML journal rebuild")
+
+    monkeypatch.setattr(workflow_service, "_rebuild_record_from_journal", _must_not_rebuild)
+
+    status = workflow_service.get_run_status("run-cold")
+
+    assert status.run_id == "run-cold"
+    assert status.state == RunState.FAILED
+    assert status.current_step_id is None
+    assert status.steps == []
+    assert "run-cold" not in workflow_service.run_registry
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+async def _noop_sweep(run_id):
+    return None
+
+
+def _make_record(run_id: str, *, process, generation: str) -> ScriptRunRecord:
+    return ScriptRunRecord(
+        run_id=run_id,
+        workflow_name="wf",
+        state=RunState.RUNNING,
+        cancelled=False,
+        current_step_id=None,
+        step_states={},
+        process=process,
+        generation=generation,
+        started_at="2026-07-08T00:00:00Z",
+        finished_at=None,
+        tier="script",
+    )
+
+
+def _seed_script_run(run_id: str, *, state: str = "running", generation: str = "1") -> None:
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        inputs_json="{}",
+        state=state,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation=generation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# U2 (issue #505) — public build_env seam + run_script_workflow_prepared (ADR-3)
+# ---------------------------------------------------------------------------
+def test_build_env_public_alias_is_same_function():
+    """ADR-3 F-2: the public seam and the pre-U2 private name are the SAME function
+    (single-homed 6-key contract) — no behavior forked by the rename."""
+    assert build_env is script_runner._build_env
+    assert build_env is script_runner.build_env
+
+
+def test_public_build_env_exact_six_keys_and_resume_flag():
+    """T12: the public seam returns exactly the 6 keys; ``resume=True`` adds the
+    7th (guards the rename did not change behavior)."""
+    env = build_env("run-x", "1", {"a": 1})
+    assert set(env) == {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
+        "PATH",
+        "HOME",
+    }
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"a":1}'
+    assert "CAO_WORKFLOW_RESUME" not in env
+    resumed = build_env("run-x", "4", {"a": 1}, resume=True)
+    assert resumed["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_run_script_workflow_prepared_drives_without_reinsert(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DR-1/DR-2 + CR-2: the script prepared entry drives an already-journaled,
+    already-registered record via ``_drive_process`` WITHOUT re-linting or
+    re-inserting the run row. It must not call ``lint_script`` or ``insert_run``."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    # C1 already journaled + registered the run before scheduling the drive — seed
+    # the real row FIRST, then wire the "must not be called again" guards.
+    _seed_script_run("run-prep-script")
+
+    def _fail_lint(*a, **k):
+        raise AssertionError("run_script_workflow_prepared must not lint")
+
+    def _fail_insert(*a, **k):
+        raise AssertionError("run_script_workflow_prepared must not insert_run")
+
+    monkeypatch.setattr(script_runner, "lint_script", _fail_lint)
+    monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
+
+    proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    record = _make_record("run-prep-script", process=None, generation="1")
+    workflow_service.run_registry["run-prep-script"] = record
+
+    env = build_env("run-prep-script", "1", {})
+    result = await run_script_workflow_prepared(
+        record, source="print('x')\n", env=env, working_directory="/prepared/root"
+    )
+
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    assert captured["cwd"] == "/prepared/root"
+    # DR-2: liveness mark cleared on exit.
+    assert "run-prep-script" not in workflow_service._active_drives
+
+
+@pytest.mark.asyncio
+async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The run is live in ``_active_drives`` while ``_drive_process`` runs and
+    absent after (finally discard) — the liveness truth crash-remnant logic uses."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    observed = {"live": None}
+
+    async def _fake_drive(record, script_path, env, *, working_directory=None):
+        observed["live"] = record.run_id in workflow_service._active_drives
+        return WorkflowRunResult(
+            run_id=record.run_id,
+            workflow_name="wf",
+            state=RunState.COMPLETED,
+            started_at=record.started_at,
+        )
+
+    monkeypatch.setattr(script_runner, "_drive_process", _fake_drive)
+    record = _make_record("run-prep-live", process=None, generation="1")
+    await run_script_workflow_prepared(
+        record, source="print('x')\n", env=build_env("run-prep-live", "1", {})
+    )
+    assert observed["live"] is True
+    assert "run-prep-live" not in workflow_service._active_drives
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fresh_run_executes_approved_bytes_after_mid_start_update(monkeypatch, tmp_path):
+    """Admission, the journal and the interpreter must all use the approved source."""
+    import hashlib
+
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        settings_service,
+        workflow_spec_service,
+    )
+
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", tmp_path / "wf.db")
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    source_a = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "A-approved-é"}\')\r\n'
+    source_b = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "B-never-approved"}\')\n'
+    spec = workflow_spec_service.create_workflow("fresh", source_a, scan_dir=str(spec_dir))
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refusal:
+        await run_script_workflow(spec, {}, "fresh-refused", working_directory=str(tmp_path))
+    approval_store.grant(refusal.value.plan_id, "test-operator")
+
+    capture = launch_guard.capture
+
+    def update_in_window(profile_set=None, root_identity=None):
+        workflow_spec_service.update_workflow(
+            spec.name, source_b, spec.content_hash, scan_dir=str(spec_dir)
+        )
+        return capture(profile_set=profile_set, root_identity=root_identity)
+
+    monkeypatch.setattr(launch_guard, "capture", update_in_window)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    materialize = script_runner._materialize_snapshot
+    staged = {}
+
+    def observe_snapshot(*args, **kwargs):
+        path = materialize(*args, **kwargs)
+        staged["path"] = path
+        staged["hash"] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        return path
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", observe_snapshot)
+    result = await run_script_workflow(spec, {}, "fresh-approved", working_directory=str(tmp_path))
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ran": "A-approved-é"}
+    row = workflow_journal.get_run("fresh-approved")
+    snapshot = json.loads(row.spec_snapshot)
+    manifest = json.loads(row.manifest_json)
+    assert (
+        staged["hash"] == manifest["source_hash"] == snapshot["content_hash"] == spec.content_hash
+    )
+    assert manifest["plan_id"] == refusal.value.plan_id
+    assert Path(spec.path).read_text() == source_b
+    assert not Path(staged["path"]).exists()
+
+
+def test_prepared_source_is_keyword_only():
+    import inspect
+
+    signature = inspect.signature(run_script_workflow_prepared)
+    assert "spec_path" not in signature.parameters
+    assert signature.parameters["source"].kind == inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        run_script_workflow_prepared(
+            _make_record("old-caller", process=None, generation="1"), "/tmp/wf.py", {}
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "failure", "timeout", "cancel", "spawn-failure", "exception"]
+)
+async def test_fresh_snapshot_lifecycle(monkeypatch, tmp_path, outcome, prepared):
+    """Private source exists during the drive and is removed on every exit path."""
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.01)
+    spec = _FakeScriptSpec(source="print('approved')\n", path=str(tmp_path / "author.py"))
+    Path(spec.path).write_text(spec.source)
+    run_id = "snapshot-lifecycle"
+    seen = []
+
+    def observe(path):
+        staged = Path(path)
+        assert staged != Path(spec.path)
+        assert staged.read_text() == spec.source
+        assert staged.stat().st_mode & 0o777 == 0o600
+        assert scratch.stat().st_mode & 0o777 == 0o700
+        assert not staged.stem.isidentifier()
+        assert staged.name == f"start-{run_id}.py"
+        seen.append(staged)
+
+    proc = _FakeProcess(exit_rc=1 if outcome == "failure" else 0, hang=outcome == "timeout")
+
+    async def spawn(*args, **kwargs):
+        observe(args[1])
+        if outcome == "spawn-failure":
+            raise OSError("spawn refused")
+        if outcome == "cancel":
+            script_runner.run_registry[run_id].cancelled = True
+        return proc
+
+    async def raising_drive(record, path, env, *, working_directory=None):
+        observe(path)
+        raise RuntimeError("drive exception")
+
+    monkeypatch.setattr(script_runner.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    if outcome == "exception":
+        monkeypatch.setattr(script_runner, "_drive_process", raising_drive)
+
+    async def start():
+        if not prepared:
+            return await run_script_workflow(spec, {}, run_id)
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        script_runner.run_registry[run_id] = record
+        return await run_script_workflow_prepared(record, source=spec.source, env={})
+
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="drive exception"):
+            await start()
+    else:
+        result = await start()
+        state = {"success": RunState.COMPLETED, "cancel": RunState.CANCELLED}.get(
+            outcome, RunState.FAILED
+        )
+        kind = {"success": None, "cancel": "cancelled", "timeout": "timeout"}.get(outcome, "error")
+        assert result.state == state
+        assert result.kind == kind
+        assert workflow_journal.get_run(run_id).state == state.value
+    assert seen and not seen[0].exists()
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+async def test_fresh_materialize_oserror_settles_failed(monkeypatch, tmp_path, prepared):
+    def cannot_stage(*args, **kwargs):
+        raise OSError(28, "No space left on device", "/private/engine/source.py")
+
+    async def must_not_drive(*args, **kwargs):
+        pytest.fail("materialization failure must not spawn")
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", cannot_stage)
+    monkeypatch.setattr(script_runner, "_drive_process", must_not_drive)
+    run_id = "stage-failure"
+    if prepared:
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        result = await run_script_workflow_prepared(record, source="print('approved')", env={})
+    else:
+        result = await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert result.warnings == [
+        "could not stage the approved script source: No space left on device"
+    ]
+    assert workflow_journal.get_run(run_id).state == "failed"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["fdopen", "write"])
+async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, tmp_path, failure):
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    fdopen = script_runner.os.fdopen
+
+    class FailingWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def write(self, source):
+            self.stream.write(source[:5])
+            raise OSError(28, "No space left on device")
+
+    def fail_materialize(fd, *args, **kwargs):
+        if failure == "fdopen":
+            raise OSError(24, "Too many open files")
+        return FailingWriter(fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(script_runner.os, "fdopen", fail_materialize)
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "partial-stage-failure")
+    assert result.state == RunState.FAILED
+    assert not (scratch / "start-partial-stage-failure.py").exists()
+    assert "partial-stage-failure" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_insert_failure_stops_enforced_script_before_spawn(
+    monkeypatch, tmp_path, enforced, caplog
+):
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    private_path = str(tmp_path / "private-journal-location")
+
+    def insert_failure(*args, **kwargs):
+        raise RuntimeError(private_path)
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "insert-failed", working_directory=str(tmp_path)
+    )
+    warnings = [
+        entry
+        for entry in caplog.records
+        if entry.name == script_runner.logger.name and "insert_run" in entry.getMessage()
+    ]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert private_path not in caplog.text
+    if enforced:
+        assert spawned == {}, "an approved run without its journal row must never spawn"
+        assert result.state == RunState.FAILED
+        assert result.kind == "error"
+        assert result.warnings == [
+            "Could not durably record this script run; no script was started. "
+            "Repair the run journal and start a new run."
+        ]
+        assert private_path not in result.model_dump_json()
+        record = script_runner.run_registry["insert-failed"]
+        assert record.state == RunState.FAILED and record.finished_at is not None
+        assert "insert-failed" not in script_runner._active_drives
+    else:
+        assert spawned
+        assert result.state == RunState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_duplicate_insert_preserves_winning_live_run(monkeypatch, tmp_path, enforced):
+    """A loser at the INSERT boundary must not settle or replace the winner."""
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    run_id = "duplicate-insert"
+    winner = _make_record(run_id, process=None, generation="7")
+    workflow_journal.insert_run(
+        run_id,
+        "winning-workflow",
+        '{"source":"winner"}',
+        '{"owner":"winner"}',
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    script_runner.run_registry[run_id] = winner
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    conflict = None
+    try:
+        # The HTTP availability check can already have passed before the winner
+        # inserts. Exercise the real duplicate constraint at the engine boundary.
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    except KeyError as exc:
+        conflict = exc
+
+    assert workflow_journal.get_run(run_id) == before, "the winning row must remain untouched"
+    assert script_runner.run_registry[run_id] is winner
+    assert winner.state == RunState.RUNNING and winner.finished_at is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}
+    assert conflict is not None and "already exists" in str(conflict)
+
+
+@pytest.mark.asyncio
+async def test_insert_failure_refuses_when_enforcement_turns_on_after_capture(
+    monkeypatch, tmp_path
+):
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":false}}')
+    real_capture = script_runner.launch_guard.capture
+    captured = []
+
+    def capture(profile_set=None, root_identity=None):
+        guard = real_capture(profile_set=profile_set)
+        captured.append(guard)
+        return guard
+
+    def insert_failure(*args, **kwargs):
+        assert json.loads(args[2])["launch_guard"] == {"approval_required": False}
+        settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
+        raise RuntimeError(str(tmp_path / "private-journal-location"))
+
+    monkeypatch.setattr(script_runner.launch_guard, "capture", capture)
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "posture-flipped", working_directory=str(tmp_path)
+    )
+    assert captured == [{"approval_required": False}]
+    assert spawned == {}, "the current posture must be re-read before any spawn"
+    assert result.state == RunState.FAILED and result.kind == "error"
+    assert script_runner.run_registry["posture-flipped"].finished_at is not None
+    assert "posture-flipped" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before-commit", "after-commit"])
+@pytest.mark.parametrize("enforced", [False, True], ids=["opt-out", "enforced"])
+async def test_cancel_during_insert_is_honoured_before_spawn(
+    monkeypatch, tmp_path, timing, enforced
+):
+    """Cancel on the real loop while INSERT's worker has not returned to it."""
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    loop = asyncio.get_running_loop()
+    insert_run = workflow_journal.insert_run
+    run_id = "cancel-during-insert"
+    replies = []
+    errors = []
+    writes = []
+    update_run_state = workflow_journal.update_run_state
+
+    def track_state(run_id, state, *args, **kwargs):
+        writes.append(state)
+        return update_run_state(run_id, state, *args, **kwargs)
+
+    monkeypatch.setattr(workflow_journal, "update_run_state", track_state)
+
+    def cancel():
+        future = asyncio.run_coroutine_threadsafe(
+            api_main.cancel_workflow_run_endpoint(run_id, []), loop
+        )
+        try:
+            replies.append(future.result(timeout=5))
+        except HTTPException as exc:
+            errors.append(exc.status_code)
+
+    def insert_then_cancel(*args, **kwargs):
+        if timing == "before-commit":
+            cancel()
+        insert_run(*args, **kwargs)
+        if timing == "after-commit":
+            cancel()
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_then_cancel)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path)
+    )
+    assert errors == [], "an admission cancel must not return 404"
+    assert replies == [{"success": True, "run_id": run_id}]
+    assert result.state == RunState.CANCELLED and result.kind == "cancelled"
+    assert spawned == {}, "an acknowledged admission cancel must prevent spawning"
+    row = workflow_journal.get_run(run_id)
+    assert row.state == RunState.CANCELLED.value and row.generation == "2"
+    assert RunState.COMPLETED.value not in writes
+    record = script_runner.run_registry[run_id]
+    assert record.cancelled and record.state == RunState.CANCELLED
+    assert record.process is None and record.generation == "2"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True], ids=["own-entry", "winner-entry"])
+async def test_duplicate_insert_removes_only_its_own_publication(
+    monkeypatch, tmp_path, replacement
+):
+    run_id = "duplicate-publication"
+    winner = _make_record(run_id, process=None, generation="7")
+    insert_run = workflow_journal.insert_run
+    insert_run(
+        run_id,
+        "winner",
+        '{"source":"winner"}',
+        "{}",
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    publications = []
+
+    def duplicate(*args, **kwargs):
+        publications.append(script_runner.run_registry.get(run_id))
+        if replacement:
+            script_runner.run_registry[run_id] = winner
+            script_runner._active_drives.add(run_id)
+        return insert_run(*args, **kwargs)  # the real duplicate constraint
+
+    monkeypatch.setattr(workflow_journal, "insert_run", duplicate)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    with pytest.raises(KeyError, match="already exists"):
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    assert len(publications) == 1 and isinstance(publications[0], ScriptRunRecord)
+    assert publications[0] is not winner
+    assert workflow_journal.get_run(run_id) == before
+    assert spawned == {}
+    if replacement:
+        assert script_runner.run_registry[run_id] is winner
+        assert run_id in script_runner._active_drives
+    else:
+        assert run_id not in script_runner.run_registry
+        assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+async def test_active_drive_without_registry_rejects_new_admission(monkeypatch):
+    run_id = "active-without-record"
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    with pytest.raises(KeyError, match="already exists"):
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert run_id not in script_runner.run_registry
+    assert workflow_journal.get_run(run_id) is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}

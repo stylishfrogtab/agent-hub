@@ -1,0 +1,519 @@
+# Development Guide
+
+This guide covers setting up your development environment and running tests for the CLI Agent Orchestrator project.
+
+## Prerequisites
+
+- Python 3.11 or higher
+- [uv](https://docs.astral.sh/uv/) - Fast Python package installer and resolver
+- Git
+- tmux 3.2+ (for running the orchestrator and integration tests)
+
+## Getting Started
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/awslabs/cli-agent-orchestrator.git
+cd cli-agent-orchestrator/
+```
+
+### 2. Install Dependencies
+
+The project uses `uv` for package management. Install all dependencies including development packages:
+
+```bash
+uv sync
+```
+
+This command:
+- Creates a virtual environment (if one doesn't exist)
+- Installs all project dependencies
+- Installs development dependencies (pytest, coverage tools, linters, etc.)
+
+### 3. Verify Installation
+
+```bash
+# Check that the CLI is available
+uv run cao --help
+
+# Run a quick test to ensure everything is working
+uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
+```
+
+## Developing in GitHub Codespaces
+
+If you prefer a pre-configured cloud environment, the project runs end-to-end inside a GitHub Codespace. See [docs/codespaces.md](docs/codespaces.md) for the server start command, port forwarding, and troubleshooting tips.
+
+## Web UI Development
+
+The web UI is a React + Vite + Tailwind app in `web/`.
+
+```bash
+# Install frontend dependencies
+cd web/
+npm install
+
+# Start dev server (hot-reloads on file changes)
+npm run dev        # http://localhost:5173
+
+# Build for production (outputs to src/cli_agent_orchestrator/web_ui/)
+npm run build
+```
+
+> **Important:** The build step is required before installing the package with
+> `uv tool install .`. Skipping it leaves `web_ui/` empty and causes `cao-server`
+> to return `404 Not Found` on every request to the web UI.
+> Run `npm run build` from `web/` first, then reinstall:
+> ```bash
+> cd web && npm run build
+> uv tool install --reinstall .
+> ```
+
+The Vite dev server proxies API calls to the backend at `localhost:9889`. Make sure `cao-server` is running before starting the frontend.
+
+## Running Tests
+
+> **Recording test fixtures?** Provider fixtures are captured from live CLI
+> output and can embed secrets/PII (including in ANSI escape streams). Record on
+> a synthetic account and scrub identity/banner lines before committing — see
+> [CONTRIBUTING.md](CONTRIBUTING.md#recording-test-fixtures-safely). A gitleaks
+> scan gates every PR; run it locally with `scripts/security-scan.sh gitleaks`.
+
+**The suite never touches your real home.** `test/conftest.py` points `HOME` at a
+throwaway directory for the whole session and unsets the variables that relocate
+CAO's or a provider's config root (`CAO_HOME_DIR`, `CAO_TMP_DIR`, `KIRO_HOME`,
+`CODEX_HOME`, `GROK_HOME`, the `XDG_*_HOME` dirs and others), so
+`~/.aws/cli-agent-orchestrator`, `~/.gemini`, `~/.kiro` and the rest resolve under
+it, as on a fresh CI runner. Exactly two things are kept:
+
+- a root variable that already points under the system temp directory, such as
+  `CAO_HOME_DIR=$(mktemp -d) uv run pytest ...`; a root anywhere else, inside or
+  outside your home, is unset;
+- `RUSTUP_HOME` and `CARGO_HOME`, which keep pointing at your `~/.rustup` and
+  `~/.cargo` so `test_no_ffi_guard` can run `cargo metadata`. cargo may update its
+  own `~/.cargo/.global-cache` while it does.
+
+**The suite never reaches your tmux server either.** CAO's agents run inside tmux,
+so pytest is often started from a tmux pane, where `TMUX` names that pane's
+server. `test/conftest.py` removes `TMUX` and `TMUX_PANE` and points `TMUX_TMPDIR`
+at a fresh directory under `/tmp` (short, because macOS caps a socket path at
+about 104 bytes), and stops any server a test left there when the session ends.
+Each `pytest -n` worker gets its own directory. Sessions that keep the real
+`HOME` (below) keep the real tmux environment too.
+
+**Rule for any code or test that runs tmux:** either clear `TMUX` and `TMUX_PANE`
+from the environment it runs with (`env -u TMUX -u TMUX_PANE`, or pop them from
+the `env` dict) *and* set a private `TMUX_TMPDIR`, or address the server
+explicitly with `-S <socket>` or `-L <name>`. Neither half of the first option
+works alone. `TMUX_TMPDIR` on its own is not isolation inside tmux: tmux gives
+`TMUX` priority, so `dict(os.environ, TMUX_TMPDIR=tmp)` still reaches the server
+you are working in, and a `kill-server` there ends every session on it. Clearing
+`TMUX` without a private `TMUX_TMPDIR` reaches the default socket, which is
+usually the same server. Never run a bare `tmux kill-server` outside the test
+harness. `test/test_tmux_isolation.py` checks the harness side of this.
+
+**A session that keeps the real `HOME` keeps the real tmux environment, and the
+harness stops no tmux server for it.** That is any session with
+`CAO_TEST_REAL_HOME=1` (which overrides the rest; `=0` forces isolation), an `-m`
+expression that selects `e2e` (`-m e2e`, `-m "e2e or x"`), or a test path with a
+component named exactly `e2e` (`test/e2e/...`, even with `-m "not e2e"`;
+`test_e2e_x.py` does not count) or `test_kiro_cli_integration.py`. CAO starts
+every tmux server with `exit-empty off`, so a server a test starts there keeps
+running after pytest exits. To run such a session on a private tmux, give it a
+private `TMUX_TMPDIR` with `TMUX` and `TMUX_PANE` cleared
+(`env -u TMUX -u TMUX_PANE`); otherwise the tests reach your own server. Before
+removing that directory, stop its server, in the same `EXIT` trap, kill first
+and then `rm` (the directory is under `/tmp` because of the socket-path cap):
+`export TMUX_TMPDIR="$(mktemp -d /tmp/cao-tmux.XXXXXX)"`, then
+`trap 'env -u TMUX -u TMUX_PANE tmux -S "$TMUX_TMPDIR/tmux-$(id -u)/default" kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT`.
+
+The suite also never runs a coding-agent CLI for memory compilation or lint: the
+LLM client is stubbed to "none" unless a test installs its own.
+
+Sessions that select E2E tests or `test_kiro_cli_integration.py` keep the real
+`HOME`, because they drive authenticated provider CLIs. `CAO_TEST_REAL_HOME=1`
+keeps it for any session and `CAO_TEST_REAL_HOME=0` forces isolation; a single
+test opts out with `@pytest.mark.real_home`. Under `pytest -n`, each worker takes
+the controller's decision, so `-n` with E2E keeps the real `HOME` too.
+
+### Unit Tests
+
+Most tests mock external dependencies, but the default invocation is not unit-only: its
+marker filter matches CI's (`-m "not e2e"`), so it also collects every `integration`-marked
+test, including ones that spawn a real `cao-server` subprocess or drive real tmux. See
+[Integration Tests](#integration-tests) below.
+
+```bash
+# Run the default suite (same marker filter CI uses — see "What CI runs" for the
+# path differences that remain)
+uv run pytest -v
+
+# Run with coverage report
+uv run pytest --cov=src --cov-report=term-missing -v
+
+# Run specific test file
+uv run pytest test/providers/test_claude_code_unit.py -v
+
+# Run specific test class
+uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
+
+# Fast inner loop: mocked-only, skips both e2e and integration tests
+uv run pytest -m "not e2e and not integration" -v
+```
+
+### Integration Tests
+
+Integration tests require the provider CLI to be installed and authenticated. They are
+collected by the default invocation (its marker filter only excludes `e2e`), but each
+provider-specific module also carries its own `skipif` on an environment/CLI check, so
+without that CLI present it collects-and-skips rather than failing:
+
+```bash
+# Run integration tests for a specific provider (example: Kiro CLI)
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
+
+# Exclude integration tests too (the fast, mocked-only inner loop)
+uv run pytest test/providers/ -m "not e2e and not integration" -v
+```
+
+The default pytest configuration is the contributor unit-suite entry point, and its marker
+selection now matches CI's: `-m 'not e2e'` excludes only the e2e-marked tests outside
+`test/e2e/`. `test/test_suite_selection.py` pins this — it asserts that a plain contributor
+run DOES collect an `integration`-marked test. A command-line `-m` replaces the configured
+marker rather than composing with it, so append `and not integration` explicitly (as above)
+if you want the narrower, mocked-only loop.
+
+### E2E Tests
+
+E2E tests require a running CAO server, authenticated CLI tools, and tmux:
+
+```bash
+# Run all E2E tests
+uv run pytest -m e2e test/e2e/ -v
+
+# Run E2E tests for a specific provider
+uv run pytest -m e2e test/e2e/ -v -k codex
+```
+
+### Run All Tests
+
+```bash
+# Run everything except E2E (the `addopts` in pyproject.toml deselects e2e by default)
+uv run pytest -v
+
+# Same, with coverage for all modules
+uv run pytest --cov=src --cov-report=term-missing -v
+
+# Run tests in parallel (faster)
+uv run pytest -n auto
+```
+
+### What CI runs on your pull request
+
+Run this before opening a PR — it is the exact command in `.github/workflows/ci.yml`. It
+uses the same `-m "not e2e"` marker filter as the default unit-test command above, but is
+not a superset of it: it additionally `--ignore`s the two paths below (needing an
+authenticated external CLI, or live providers), so over `test/` it collects a slightly
+*smaller* population, with coverage scoped to `src/cli_agent_orchestrator` instead of all
+of `src`:
+
+```bash
+uv run pytest test/ \
+  --ignore=test/providers/test_kiro_cli_integration.py \
+  --ignore=test/e2e \
+  -m "not e2e" \
+  --cov=src/cli_agent_orchestrator --cov-report=term-missing -v
+
+uv run python scripts/validate_markdown_links.py
+```
+
+### Test Markers
+
+Tests are organized with pytest markers:
+
+```bash
+# Run only integration tests
+uv run pytest -m integration -v
+
+# Skip slow tests
+uv run pytest -m "not slow" -v
+
+# Run only async tests
+uv run pytest -m asyncio -v
+```
+
+## Code Quality
+
+### Formatting
+
+The project uses `black` for code formatting:
+
+```bash
+# Format all Python files
+uv run black src/ test/
+
+# Check formatting without making changes
+uv run black --check src/ test/
+```
+
+### Import Sorting
+
+The project uses `isort` for organizing imports:
+
+```bash
+# Sort imports
+uv run isort src/ test/
+
+# Check import sorting without making changes
+uv run isort --check-only src/ test/
+```
+
+### Type Checking
+
+The project uses `mypy` for static type checking, gated by a per-file ratchet against a
+committed baseline (see [CONTRIBUTING.md](CONTRIBUTING.md#type-checking-the-mypy-ratchet)):
+
+```bash
+# Run the blocking gate (what CI runs)
+uv run python scripts/mypy_ratchet.py
+
+# Run mypy directly for raw, unfiltered output
+uv run mypy src/
+```
+
+### Run All Quality Checks
+
+```bash
+# Format, sort imports, lint for dead code, type check, and run tests
+uv run black src/ test/
+uv run isort src/ test/
+uv run ruff check src/ test/ examples/
+uv run python scripts/mypy_ratchet.py
+uv run pytest -v
+```
+
+A ruff F841 (local assigned but never read) is not always dead code to delete. It can be
+a value the code was supposed to read: issue #752 was exactly that, a computed readiness
+marker that nothing consulted, and the fix (#992) was to read it, not remove it. Before
+deleting the assignment, ask what should have been reading it.
+
+### Validate Markdown Links
+
+Validate maintained local Markdown paths and heading fragments:
+
+```bash
+uv run python scripts/validate_markdown_links.py
+```
+
+## Development Workflow
+
+### 1. Create a Feature Branch
+
+```bash
+git checkout -b feature/your-feature-name
+```
+
+### 2. Make Changes
+
+Edit code in `src/cli_agent_orchestrator/`
+
+### 3. Add Tests
+
+Add or update tests in `test/`
+
+### 4. Run Tests Locally
+
+```bash
+# Run the default suite (matches CI's marker filter; excludes E2E, includes integration)
+uv run pytest -v
+
+# Run the larger CI suite with coverage (see the exact command above)
+uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
+  --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator \
+  --cov-report=term-missing -v
+```
+
+### 5. Check Code Quality
+
+```bash
+uv run black src/ test/
+uv run isort src/ test/
+uv run ruff check src/ test/ examples/
+uv run python scripts/mypy_ratchet.py
+```
+
+### 6. Commit and Push
+
+```bash
+git add .
+git commit -m "Add feature: description"
+git push origin feature/your-feature-name
+```
+
+### 7. Create Pull Request
+
+Create a pull request on GitHub. CI will automatically run tests and code quality checks.
+
+## CI/CD
+
+### Comprehensive Workflow (`ci.yml`)
+
+Runs on all pushes to `main` and all PRs targeting `main`:
+- **Unit tests**: Python 3.11, 3.12 matrix with coverage
+- **Code quality**: black, isort, ruff, mypy — all blocking; mypy via a per-file ratchet (see [SKILL.md](skills/cao-contributing/SKILL.md))
+- **Security scan**: Trivy filesystem scan — fails on a committed secret of any severity, or on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are uploaded to the Security tab without failing (see [SECURITY.md](SECURITY.md#running-security-scans-locally))
+- **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
+- **Dependency review**: License and vulnerability checks on PRs
+
+### Provider-Specific Workflows (path-triggered)
+
+Each provider has a dedicated workflow that runs only when its files change:
+
+| Workflow | Tests | Trigger Paths |
+|---|---|---|
+| `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
+| `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
+| `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
+
+Each includes unit tests (Python 3.11/3.12) and code quality checks (black, isort, mypy).
+
+### Docs Site Workflow (`gh-pages.yml`)
+
+Builds the Docusaurus site (`docusaurus/`) on every PR and push to `main` for a
+build signal, but only **deploys** to GitHub Pages on the upstream repo
+(`awslabs/cli-agent-orchestrator`) by default — forks don't have Pages enabled,
+so `actions/deploy-pages` would otherwise fail with a 404. Fork maintainers can
+opt in by enabling GitHub Pages in their fork and setting the `DEPLOY_DOCS_PAGES`
+repository variable to `true`; see [docusaurus/README.md](docusaurus/README.md#deploying-on-a-fork)
+for the full steps.
+
+## Working with Providers
+
+### Test Against a Real Provider CLI
+
+Integration tests exercise a real provider binary, so the CLI must be installed and authenticated before they can run. Using Kiro CLI as an example:
+
+```bash
+# Ensure the provider CLI is on PATH
+which kiro
+
+# Ensure it is authenticated (provider-specific; see docs/<provider>.md)
+kiro --help
+
+# Run that provider's integration tests
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
+```
+
+The same pattern applies to every provider that ships an `<provider>_integration.py` file — substitute the binary and the test filename.
+
+## Troubleshooting
+
+### Web UI Shows "404 Not Found"
+
+The web UI assets are not committed to the repository — they are a build artifact.
+If `cao-server` starts successfully but the browser shows `{"detail":"Not Found"}`,
+the `web_ui/` bundle is missing from the installed package.
+
+```bash
+# 1. Build the frontend
+cd web && npm install && npm run build
+
+# 2. Reinstall the package so the built assets are picked up
+cd ..
+uv tool install --reinstall .
+```
+
+### Import Errors
+
+If you encounter import errors when running tests:
+
+```bash
+# Re-sync dependencies
+uv sync
+
+# If that doesn't work, remove the virtual environment and start fresh
+rm -rf .venv
+uv sync
+```
+
+### Test Failures
+
+```bash
+# Run with verbose output
+uv run pytest -vv
+
+# Run a specific failing test
+uv run pytest test/path/to/test.py::test_name -vv
+
+# Show print statements
+uv run pytest -s
+```
+
+### Coverage Issues
+
+```bash
+# Generate detailed coverage report
+uv run pytest --cov=src --cov-report=html
+# Open htmlcov/index.html in your browser
+
+# Show missing lines
+uv run pytest --cov=src --cov-report=term-missing
+```
+
+## Adding New Dependencies
+
+### Runtime Dependencies
+
+```bash
+# Add a new runtime dependency
+uv add package-name
+
+# Add with version constraint
+uv add "package-name>=1.0.0"
+```
+
+### Development Dependencies
+
+```bash
+# Add a new development dependency
+uv add --dev package-name
+```
+
+## Project Structure
+
+```
+cli-agent-orchestrator/
+├── src/
+│   └── cli_agent_orchestrator/     # Main source code
+│       ├── api/                    # FastAPI server
+│       ├── cli/                    # CLI commands
+│       ├── clients/                # Database and tmux clients
+│       ├── mcp_server/             # MCP server implementation
+│       ├── models/                 # Data models
+│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Antigravity, Kimi, Copilot, OpenCode, Cursor)
+│       ├── services/               # Business logic services
+│       └── utils/                  # Utility functions
+├── test/                           # Test suite (511 tests, 84% coverage)
+│   ├── api/                       # API endpoint tests
+│   ├── cli/                       # CLI command tests
+│   ├── clients/                   # Client tests (database, tmux)
+│   ├── e2e/                       # End-to-end tests (require running CAO server)
+│   ├── mcp_server/                # MCP server tests
+│   ├── models/                    # Data model tests
+│   ├── providers/                 # Provider tests (unit + integration)
+│   ├── services/                  # Service layer tests
+│   └── utils/                     # Utility tests
+├── docs/                           # Documentation
+├── examples/                       # Example workflows
+├── pyproject.toml                  # Project configuration
+└── uv.lock                         # Locked dependencies
+```
+
+## Resources
+
+- [Project README](README.md)
+- [Test Documentation](test/README.md)
+- [Contributing Guidelines](CONTRIBUTING.md)
+- [uv Documentation](https://docs.astral.sh/uv/)
+- [pytest Documentation](https://docs.pytest.org/)

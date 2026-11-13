@@ -1,0 +1,2416 @@
+"""Tests for uncovered API endpoints in main.py.
+
+Covers: health, agents/profiles, agents/providers, sessions CRUD,
+terminals CRUD (create in session, list, get, input, output, delete),
+flow_daemon, lifespan, and the main() entry point.
+"""
+
+import asyncio
+import os
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from cli_agent_orchestrator.api.main import (
+    app,
+    flow_daemon,
+    inbox_reconciliation_daemon,
+    opencode_inbox_delivery_daemon,
+)
+from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.clients.database import Base
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.services import (
+    delegation_callback_service,
+    session_service,
+    terminal_service,
+)
+from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.terminal_service import (
+    IdempotencyKeyNotFound,
+    IdempotentCreateFailed,
+    TerminalRecordCorruptError,
+)
+from cli_agent_orchestrator.utils.skills import SkillNameError
+
+
+def _install_kiro_memory_manager(agents_dir):
+    """A Kiro sidecar is refused unless memory_manager is installed for Kiro (#1074)."""
+    (agents_dir / "memory_manager.json").write_text("{}")
+
+
+# ── Health endpoint ──────────────────────────────────────────────────
+
+
+class TestHealthCheck:
+    """Tests for GET /health endpoint."""
+
+    def test_health_check_returns_ok(self, client):
+        """GET /health returns status ok with component health."""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "cli-agent-orchestrator"
+        components = data["components"]
+        assert components["cao"] == "ok"
+        assert components["herdr"] in ("ok", "unavailable")
+        assert components["claude"] in ("ok", "unavailable")
+
+    def test_health_reports_the_package_version(self, client):
+        """GET /health carries the installed version (shown by the web UI's server card)."""
+        with patch("importlib.metadata.version", return_value="9.9.9"):
+            data = client.get("/health").json()
+        assert data["version"] == "9.9.9"
+
+    def test_health_version_falls_back_when_not_installed(self, client):
+        """An uninstalled source tree reports 'unknown' rather than failing the health check."""
+        from importlib.metadata import PackageNotFoundError
+
+        with patch("importlib.metadata.version", side_effect=PackageNotFoundError):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["version"] == "unknown"
+
+    def test_health_reports_terminal_backend_tmux(self, client):
+        """GET /health reports terminal_backend matching the active backend (tmux)."""
+        with patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend:
+            mock_backend.return_value = MagicMock(spec=[])  # not HerdrBackend
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "tmux"
+
+    def test_health_reports_the_servers_provider_init_timeout(self, client):
+        """Issue #710 (review on PR #1002, P3-1): clients size their wait for a
+        synchronous create from THEIR settings, so the server publishes the value
+        it applies for an operator to compare against."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_server_settings",
+            return_value={"provider_init_timeout": 180},
+        ):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["provider_init_timeout"] == 180
+
+    def test_health_reports_terminal_backend_herdr(self, client):
+        """GET /health reports terminal_backend='herdr' when server uses HerdrBackend."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        mock_herdr = MagicMock(spec=HerdrBackend)
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_herdr):
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "herdr"
+
+
+# ── Agent profiles endpoint ──────────────────────────────────────────
+
+
+class TestAgentProfiles:
+    """Tests for GET /agents/profiles endpoint."""
+
+    def test_list_profiles_success(self, client):
+        """GET /agents/profiles returns list of profiles."""
+        mock_profiles = [
+            {"name": "developer", "path": "/agents/developer"},
+            {"name": "reviewer", "path": "/agents/reviewer"},
+        ]
+        with patch(
+            "cli_agent_orchestrator.api.main.list_agent_profiles",
+            create=True,
+        ) as _mock_fn:
+            # The endpoint does a lazy import, so we need to patch at the import target
+            with patch(
+                "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+                return_value=mock_profiles,
+            ):
+                response = client.get("/agents/profiles")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2
+        assert data[0]["name"] == "developer"
+
+    def test_list_profiles_empty(self, client):
+        """GET /agents/profiles returns empty list when none exist."""
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+            return_value=[],
+        ):
+            response = client.get("/agents/profiles")
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_list_profiles_server_error(self, client):
+        """GET /agents/profiles returns 500 on internal error."""
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+            side_effect=Exception("Failed to read profiles"),
+        ):
+            response = client.get("/agents/profiles")
+
+        assert response.status_code == 500
+        assert "Failed to list agent profiles" in response.json()["detail"]
+
+
+# ── Agent providers endpoint ─────────────────────────────────────────
+
+
+class TestAgentProviders:
+    """Tests for GET /agents/providers endpoint."""
+
+    def test_list_providers_all_installed(self, client):
+        """GET /agents/providers returns all providers as installed."""
+        with patch("shutil.which", return_value="/usr/bin/dummy"):
+            response = client.get("/agents/providers")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 12
+        names = [p["name"] for p in data]
+        assert "kiro_cli" in names
+        assert "claude_code" in names
+        assert "codex" in names
+        assert "hermes" in names
+        assert "kimi_cli" in names
+        assert "copilot_cli" in names
+        assert "opencode_cli" in names
+        assert "cursor_cli" in names
+        assert "antigravity_cli" in names
+        assert "omp" in names
+        assert "grok_cli" in names
+        assert "mcode" in names
+        for p in data:
+            assert p["installed"] is True
+
+    def test_list_providers_none_installed(self, client):
+        """GET /agents/providers returns all providers as not installed."""
+        with patch("shutil.which", return_value=None):
+            response = client.get("/agents/providers")
+
+        assert response.status_code == 200
+        data = response.json()
+        for p in data:
+            assert p["installed"] is False
+
+    def test_list_providers_mixed_installed(self, client):
+        """GET /agents/providers returns mixed installation status."""
+
+        def mock_which(binary):
+            return "/usr/bin/kiro-cli" if binary == "kiro-cli" else None
+
+        with patch("shutil.which", side_effect=mock_which):
+            response = client.get("/agents/providers")
+
+        assert response.status_code == 200
+        data = response.json()
+        providers_dict = {p["name"]: p for p in data}
+        assert providers_dict["kiro_cli"]["installed"] is True
+        assert providers_dict["claude_code"]["installed"] is False
+        assert providers_dict["codex"]["installed"] is False
+        assert providers_dict["kimi_cli"]["installed"] is False
+        assert providers_dict["copilot_cli"]["installed"] is False
+        assert providers_dict["opencode_cli"]["installed"] is False
+        assert providers_dict["grok_cli"]["installed"] is False
+        assert providers_dict["mcode"]["installed"] is False
+
+    def test_list_providers_has_binary_field(self, client):
+        """Each provider entry has correct binary name."""
+        with patch("shutil.which", return_value=None):
+            response = client.get("/agents/providers")
+
+        data = response.json()
+        providers_dict = {p["name"]: p for p in data}
+        assert providers_dict["kiro_cli"]["binary"] == "kiro-cli"
+        assert providers_dict["claude_code"]["binary"] == "claude"
+        assert providers_dict["codex"]["binary"] == "codex"
+        assert providers_dict["kimi_cli"]["binary"] == "kimi"
+        assert providers_dict["copilot_cli"]["binary"] == "copilot"
+        assert providers_dict["opencode_cli"]["binary"] == "opencode"
+        assert providers_dict["antigravity_cli"]["binary"] == "agy"
+        assert providers_dict["omp"]["binary"] == "omp"
+        assert providers_dict["grok_cli"]["binary"] == "grok"
+        assert providers_dict["mcode"]["binary"] == "mcode"
+
+    def test_list_providers_preserves_common_wire_contract(self, client):
+        """Provider discovery has the same shape consumed by the web and Rust clients."""
+        response = client.get("/agents/providers")
+
+        assert response.status_code == 200
+        for provider in response.json():
+            assert set(provider) == {"name", "binary", "installed"}
+
+
+# ── Skills endpoint ──────────────────────────────────────────────────
+
+
+class TestGetSkillContent:
+    """Tests for GET /skills/{name} endpoint."""
+
+    def test_get_skill_returns_content(self, client):
+        """GET /skills/{name} returns the skill body on success."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            return_value="# Python Testing\n\nUse pytest.",
+        ):
+            response = client.get("/skills/python-testing")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "name": "python-testing",
+            "content": "# Python Testing\n\nUse pytest.",
+        }
+
+    def test_get_skill_returns_400_for_invalid_name(self, client):
+        """GET /skills/{name} returns 400 for path traversal names."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=SkillNameError(
+                "Invalid skill name '../secret': must not contain '/', '\\\\', or '..'"
+            ),
+        ):
+            response = client.get("/skills/%2E%2E")
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid skill name: .."
+
+    def test_get_skill_returns_404_for_missing_skill(self, client):
+        """GET /skills/{name} returns 404 when the skill does not exist."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=FileNotFoundError("Skill folder does not exist"),
+        ):
+            response = client.get("/skills/missing-skill")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Skill not found: missing-skill"
+
+    def test_get_skill_returns_500_for_parse_error(self, client):
+        """GET /skills/{name} returns 500 for invalid skill file content."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=ValueError("Failed to parse skill file '/tmp/SKILL.md': bad yaml"),
+        ):
+            response = client.get("/skills/broken-skill")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == (
+            "Failed to load skill: Failed to parse skill file '/tmp/SKILL.md': bad yaml"
+        )
+
+    def test_get_skill_returns_500_for_filesystem_error(self, client):
+        """GET /skills/{name} returns 500 for unexpected filesystem errors."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=OSError("Permission denied"),
+        ):
+            response = client.get("/skills/python-testing")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Failed to load skill: Permission denied"
+
+
+# ── Sessions CRUD ────────────────────────────────────────────────────
+
+
+class TestValidateResumeSessionId:
+    """Focused tests on the resume_session_id validation boundary.
+
+    This validator guards a string that is later interpolated into the
+    provider shell command (``claude --resume <sid>``); these tests pin the
+    accepted charset so a future regex edit cannot silently widen what
+    reaches the shell command.
+    """
+
+    def test_valid_ids_pass(self):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        for value in [
+            "abcdefgh",  # 8 chars: minimum length
+            "01234567-89ab-cdef-0123-456789abcdef",  # UUID shape
+            "A1.b2_c3-d4",
+            "a" * 64,  # maximum length
+        ]:
+            _validate_resume_session_id(value)  # must not raise
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "abc defg",  # embedded space
+            "abcdefg;",  # shell separator
+            "$(whoami)x",  # command substitution
+            "abcdefg",  # 7 chars: too short
+            "a" * 65,  # 65 chars: too long
+            ".abcdefgh",  # leading dot
+            "abcdefgh\n",  # trailing newline (regex must anchor with \\Z)
+            "",  # empty
+        ],
+    )
+    def test_invalid_ids_raise(self, value):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        with pytest.raises(ValueError):
+            _validate_resume_session_id(value)
+
+
+class TestCreateSession:
+    """Tests for POST /sessions endpoint — success and error cases."""
+
+    def test_create_session_success(self, client):
+        """POST /sessions creates a session and returns 201."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["id"] == "abcd1234"
+        assert data["provider"] == "kiro_cli"
+        assert data["agent_profile"] == "developer"
+        mock_svc.create_session.assert_called_once_with(
+            provider="kiro_cli",
+            agent_profile="developer",
+            session_name=None,
+            working_directory=None,
+            allowed_tools=None,
+            registry=ANY,
+            env_vars=None,
+            engine=None,
+            initial_message=None,
+            initial_message_orchestration_type=None,
+            model=None,
+            use_worktree=False,
+            idempotency_key=None,
+            resume_session_id=None,
+            group=None,
+            metadata=None,
+            caller_ceiling=None,
+        )
+
+    def test_create_session_forwards_use_worktree_true(self, client):
+        """Regression (review on PR #634): a fresh session used to have
+        use_worktree silently dropped -- POST /sessions had no such
+        parameter at all, unlike its /sessions/{name}/terminals sibling."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "use_worktree": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["use_worktree"] is True
+
+    def test_create_session_worktree_error_maps_to_400(self, client):
+        """A working_directory that isn't a git repo is a client-input
+        problem, not a server crash -- mirrors POST
+        /sessions/{name}/terminals's identical mapping."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=WorktreeError("'/tmp/x' is not inside a git repository")
+            )
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "use_worktree": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "not inside a git repository" in response.json()["detail"]
+
+    def test_create_session_forwards_idempotency_key(self, client):
+        """Review on PR #634, issue #616."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "retry-1",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["idempotency_key"] == "retry-1"
+
+    def test_memory_manager_sidecar_gets_a_key_derived_from_the_callers(
+        self, client, hermetic_kiro_agent_store
+    ):
+        """A keyed retry must not spawn a SECOND memory_manager (review on PR #634).
+
+        The sidecar spawn is unconditional -- it runs after ``create_session``
+        whether the primary was created or resolved from an existing key -- and
+        the returned ``Terminal`` cannot say which. So two identical keyed
+        requests used to produce two sidecars for one primary, which is the
+        no-duplicate-workers criterion the key exists to hold.
+
+        Asserted at the DERIVED KEY rather than by counting spawns, because the
+        key is what makes the sidecar create idempotent in its own right: given
+        it, the second request reuses the first sidecar inside
+        ``create_terminal`` even in the races a created-vs-reused boolean would
+        miss. Suffixed so it can never collide with the caller's own key.
+        """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="cao-primary",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal"
+            ) as mock_create,
+        ):
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+            mock_create.return_value = mock_terminal
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "memory_manager": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_create.call_args.kwargs["agent_profile"] == "memory_manager"
+        assert mock_create.call_args.kwargs["idempotency_key"] == "job-1:memory-manager-sidecar"
+
+    def test_unkeyed_session_leaves_the_sidecar_unkeyed(self, client, hermetic_kiro_agent_store):
+        """No caller key means no sidecar key -- the default path is unchanged.
+
+        Pinned because deriving `f"{key}:..."` from a `None` key would silently
+        claim the literal string `"None:memory-manager-sidecar"` for every
+        unkeyed request on the server, permanently, after the first one.
+        """
+        _install_kiro_memory_manager(hermetic_kiro_agent_store)
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="cao-primary",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal"
+            ) as mock_create,
+        ):
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+            mock_create.return_value = mock_terminal
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "memory_manager": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_create.call_args.kwargs["idempotency_key"] is None
+
+    def test_replay_of_a_failed_create_is_424_with_the_cause(self, client):
+        """Review on PR #773: distinct from a plain 500, so the caller reports
+        the original failure instead of retrying it."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotentCreateFailed("terminal 'a' failed to initialize: boom")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 424
+        assert "failed to initialize: boom" in response.json()["detail"]
+
+    def test_lookup_only_without_a_key_is_400(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "lookup_only requires" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_lookup_only_is_forwarded_and_a_miss_is_404(self, client):
+        """Review on PR #773: ``lookup_only`` reaches the service, and a key
+        with nothing committed is a 404 -- not the 400 this endpoint gives a
+        ValueError, and never a create."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 404
+        assert mock_svc.create_session.call_args.kwargs["lookup_only"] is True
+
+    def test_lookup_only_does_not_ask_the_decider(self, client):
+        """Review on PR #773: a lookup never launches, so a delegation_message
+        sent with it must not reach prepare_launch."""
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.prepare_launch", new=AsyncMock()) as decider,
+        ):
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+                json={"delegation_message": "do the task", "delegation_kind": "handoff"},
+            )
+
+        assert response.status_code == 404
+        decider.assert_not_called()
+
+    def test_plain_value_error_still_maps_to_400(self, client):
+        """A plain ``ValueError`` from session creation maps to 400 (review on PR #634)."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=ValueError("Session 'test-session' already exists")
+            )
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 400
+
+    def test_corrupt_terminal_row_is_500_not_400(self, client):
+        """The other endpoint: 500 rather than this one's 400 (review on PR #634)."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=TerminalRecordCorruptError("stored row does not validate")
+            )
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 500
+
+    def test_create_session_passes_explicit_kiro_engine(self, client):
+        """An explicit engine reaches the session service and the response."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+            engine="kas",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "kas"},
+            )
+
+        assert response.status_code == 201
+        assert response.json()["engine"] == "v3"
+        assert mock_svc.create_session.call_args.kwargs["engine"] is KiroEngine.V3
+
+    def test_create_session_passes_model_and_initial_message(self, client):
+        """The launch override and first task reach the session service, while
+        the task remains in the JSON body rather than the request URL."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        initial_message = "Review the current change"
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "codex",
+                    "agent_profile": "developer",
+                    "model": "gpt-5.1-codex",
+                },
+                json={
+                    "initial_message": initial_message,
+                    "initial_message_orchestration_type": "send_message",
+                },
+            )
+
+        assert response.status_code == 201
+        assert initial_message not in str(response.request.url)
+        call_kwargs = mock_svc.create_session.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-5.1-codex"
+        assert call_kwargs["initial_message"] == initial_message
+        assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+
+    def test_create_session_preserves_env_vars_body_shape(self, client):
+        """Existing cao launch --env callers keep using {"env_vars": {...}}."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {"FEATURE_MODE": "enabled"}},
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["env_vars"] == {"FEATURE_MODE": "enabled"}
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "HOME",
+            "PATH",
+        ],
+    )
+    def test_create_session_rejects_startup_hijack_env_vars(self, client, key):
+        """A direct HTTP caller cannot stage a loader/shell/interpreter hook into the pane.
+
+        Previously these reached TmuxClient._merge_extra_env unchecked; the
+        prefix-only filter there let them through, so with authentication off
+        any loopback client could run code as the operator at pane start.
+        """
+        payload = "/tmp/evil-payload-9f3a.so"
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {key: payload}},
+            )
+
+        assert response.status_code == 422
+        body = response.text
+        assert key in body
+        assert payload not in body  # NFR-SEC-4: the value never round-trips
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_blocked_prefix_env_var_instead_of_dropping(self, client):
+        """The shared validator now runs at the HTTP boundary: a provider-prefixed key
+        that the CLI would refuse is a 422 here too, not a silent server-side drop."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {"CODEX_TOKEN": "x", "FEATURE_MODE": "enabled"}},
+            )
+
+        assert response.status_code == 422
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_malformed_model(self, client):
+        """Malformed model IDs fail before any session is created."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "agent_profile": "developer",
+                    "model": "invalid;model",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "model" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_empty_initial_message(self, client):
+        """An explicitly supplied but undeliverable empty task is not ignored."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"initial_message": ""},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "initial_message must not be empty"
+        mock_svc.create_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_detail"),
+        [
+            (
+                {"initial_message_orchestration_type": "send_message"},
+                "initial_message_orchestration_type requires initial_message",
+            ),
+            (
+                {
+                    "initial_message": "Review the current change",
+                    "initial_message_orchestration_type": "invalid",
+                },
+                "invalid initial_message_orchestration_type: 'invalid'",
+            ),
+        ],
+    )
+    def test_create_session_rejects_invalid_initial_message_orchestration(
+        self, client, payload, expected_detail
+    ):
+        """Invalid initial-message orchestration fails at the API boundary."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json=payload,
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == expected_detail
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_with_session_name(self, client):
+        """POST /sessions with explicit session_name."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="my-custom-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": "my-custom-session",
+                },
+            )
+
+        assert response.status_code == 201
+        call_kwargs = mock_svc.create_session.call_args.kwargs
+        assert call_kwargs["session_name"] == "my-custom-session"
+        assert call_kwargs["registry"] is not None
+
+    def test_create_session_value_error(self, client):
+        """POST /sessions returns 400 on ValueError."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.side_effect = ValueError("Invalid provider")
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "bad_provider",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "Invalid provider" in response.json()["detail"]
+
+    def test_create_session_server_error(self, client):
+        """POST /sessions returns 500 on unexpected error."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.side_effect = Exception("TMux crashed")
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 500
+        assert "Failed to create session" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        # NB: '-leading' is not in this set — terminal_service prepends the
+        # SESSION_PREFIX 'cao-' so the effective name becomes 'cao--leading',
+        # which is a valid tmux target (no leading dash). The boundary check
+        # validates the prefixed value, so leading-dash inputs are accepted
+        # here but rejected on path-param routes that have no prefixing.
+        ["evil:name", "evil.name", "with space", "../escape", "name;rm"],
+    )
+    def test_create_session_rejects_unsafe_name(self, client, bad_name):
+        """POST /sessions rejects session names that could break tmux target parsing."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": bad_name,
+                },
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_name_that_overflows_after_prefix(self, client):
+        """A 64-char name (max valid) becomes 68 chars after the cao- prefix
+        is prepended by terminal_service. The boundary check must catch this
+        with a 400 instead of letting it slip through to a sink failure.
+        """
+        # 64 ascii chars — passes the validator on its own, but cao-prefixed
+        # is 68 chars, exceeds the 64-char cap, must be rejected.
+        long_name = "a" * 64
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": long_name,
+                },
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_accepts_already_prefixed_name(self, client):
+        """An already-prefixed valid name should not be double-prefixed in
+        the validation check.
+        """
+        # 60 chars after the cao- prefix → 64 total, exactly at the limit.
+        prefixed = "cao-" + "b" * 60
+        from cli_agent_orchestrator.models.terminal import Terminal as TerminalModel
+
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(
+                return_value=TerminalModel(
+                    id="abcd1234",
+                    name="w",
+                    session_name=prefixed,
+                    provider="kiro_cli",
+                    agent_profile="developer",
+                )
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": prefixed,
+                },
+            )
+
+        assert response.status_code == 201
+        mock_svc.create_session.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_get_session_rejects_unsafe_name(self, client, bad_name):
+        """GET /sessions/{name} returns 400 for unsafe names (validation,
+        not "not found")."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.get(f"/sessions/{bad_name}")
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.get_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_delete_session_rejects_unsafe_name(self, client, bad_name):
+        """DELETE /sessions/{name} returns 400 for unsafe names."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.delete(f"/sessions/{bad_name}")
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.delete_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_create_terminal_rejects_unsafe_session_name(self, client, bad_name):
+        """POST /sessions/{name}/terminals returns 400 for unsafe session names."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.post(
+                f"/sessions/{bad_name}/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_terminal.assert_not_called()
+
+
+class TestListSessions:
+    """Tests for GET /sessions endpoint."""
+
+    def test_list_sessions_success(self, client):
+        """GET /sessions returns list of sessions."""
+        mock_sessions = [
+            {"id": "cao-session-1", "windows": 2},
+            {"id": "cao-session-2", "windows": 1},
+        ]
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.list_sessions.return_value = mock_sessions
+
+            response = client.get("/sessions")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2
+
+    def test_list_sessions_empty(self, client):
+        """GET /sessions returns empty list."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.list_sessions.return_value = []
+
+            response = client.get("/sessions")
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_list_sessions_server_error(self, client):
+        """GET /sessions returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.list_sessions.side_effect = Exception("TMux not running")
+
+            response = client.get("/sessions")
+
+        assert response.status_code == 500
+        assert "Failed to list sessions" in response.json()["detail"]
+
+
+class TestGetSession:
+    """Tests for GET /sessions/{session_name} endpoint."""
+
+    def test_get_session_success(self, client):
+        """GET /sessions/{name} returns session details.
+
+        Serialize and transport pending counts supplied by the mocked service.
+        """
+        mock_session = {
+            "session": {"id": "test-session"},
+            "terminals": [
+                {"id": "abcd1234", "pending_inbox_count": 123},
+                {"id": "def56789", "pending_inbox_count": 0},
+            ],
+        }
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.get_session.return_value = mock_session
+
+            response = client.get("/sessions/test-session")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["session"]["id"] == "test-session"
+        assert data["terminals"][0]["id"] == "abcd1234"
+        assert [t["pending_inbox_count"] for t in data["terminals"]] == [123, 0]
+        assert all(type(t["pending_inbox_count"]) is int for t in data["terminals"])
+        mock_svc.get_session.assert_called_once_with("test-session")
+
+    def test_get_session_not_found(self, client):
+        """GET /sessions/{name} returns 404 for nonexistent session."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.get_session.side_effect = ValueError("Session 'nonexistent' not found")
+
+            response = client.get("/sessions/nonexistent")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_get_session_server_error(self, client):
+        """GET /sessions/{name} returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.get_session.side_effect = Exception("Unexpected error")
+
+            response = client.get("/sessions/test-session")
+
+        assert response.status_code == 500
+        assert "Failed to get session" in response.json()["detail"]
+
+    def test_get_session_dispatches_via_to_thread(self, client):
+        """#558: session_service.get_session() calls status_monitor.get_status() once per
+        terminal in the session, which for a PROCESSING terminal can shell out to a real
+        tmux capture-pane subprocess (the stale-PROCESSING fallback) -- a session with N
+        processing terminals would fork N times inline on the event loop per request
+        otherwise, and the web UI polls this endpoint. Pin the asyncio.to_thread wrapping
+        directly: the tests above mock session_service entirely and cannot see HOW it was
+        called, so a regression back to a bare synchronous call would stay green."""
+        mock_session = {"id": "test-session", "windows": []}
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.asyncio.to_thread", wraps=asyncio.to_thread
+            ) as mock_to_thread,
+        ):
+            mock_svc.get_session.return_value = mock_session
+            response = client.get("/sessions/test-session")
+            get_session_calls = [
+                c for c in mock_to_thread.call_args_list if c.args[0] == mock_svc.get_session
+            ]
+
+        assert response.status_code == 200
+        assert get_session_calls, "session_service.get_session was never dispatched via to_thread"
+        assert get_session_calls[0].args[1] == "test-session"
+
+
+class TestDeleteSession:
+    """Tests for DELETE /sessions/{session_name} endpoint."""
+
+    def test_delete_session_success(self, client):
+        """DELETE /sessions/{name} deletes session and returns success."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {
+                "deleted": ["cao-test-session"],
+                "errors": [],
+            }
+
+            response = client.delete("/sessions/cao-test-session")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["deleted"] == ["cao-test-session"]
+        mock_svc.delete_session.assert_called_once_with("cao-test-session", registry=ANY)
+
+    def test_delete_session_bare_name_targets_the_cao_session_only(self, client):
+        """DELETE /sessions/dev is an alias for cao-dev, never the operator's own 'dev'."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["cao-dev"], "errors": []}
+
+            response = client.delete("/sessions/dev")
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with("cao-dev", registry=ANY)
+
+    def test_delete_session_deferred_cleanup_is_conflict(self, client):
+        """Deferred Grok cleanup must not look like a successful delete."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {
+                "deleted": [],
+                "errors": [
+                    {
+                        "terminal_id": "grok-terminal",
+                        "error": "cleanup deferred; retry delete_session",
+                    }
+                ],
+            }
+
+            response = client.delete("/sessions/test-session")
+
+        assert response.status_code == 409
+        assert "cleanup deferred" in response.json()["detail"]
+        assert "test-session" in response.json()["detail"]
+
+    def test_delete_session_not_found(self, client):
+        """DELETE /sessions/{name} returns 404 for nonexistent session."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.side_effect = ValueError("Session 'nonexistent' not found")
+
+            response = client.delete("/sessions/nonexistent")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_delete_session_server_error(self, client):
+        """DELETE /sessions/{name} returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.side_effect = Exception("TMux error")
+
+            response = client.delete("/sessions/test-session")
+
+        assert response.status_code == 500
+        assert "Failed to delete session" in response.json()["detail"]
+
+
+# ── Terminals in sessions ────────────────────────────────────────────
+
+
+class TestCreateTerminalInSession:
+    """Tests for POST /sessions/{session_name}/terminals endpoint."""
+
+    def test_create_terminal_success(self, client):
+        """POST /sessions/{name}/terminals creates terminal and returns 201."""
+        mock_terminal = Terminal(
+            id="abcd5678",
+            name="test-window-2",
+            session_name="test-session",
+            provider="claude_code",
+            agent_profile="reviewer",
+            model="model-x",
+            model_honored=True,
+        )
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            # The endpoint awaits terminal_service.create_terminal, so the
+            # patched attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_terminal = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "claude_code",
+                    "agent_profile": "reviewer",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["id"] == "abcd5678"
+        assert data["session_name"] == "test-session"
+        assert data["model"] == "model-x"
+        assert data["model_honored"] is True
+        call_kwargs = mock_svc.create_terminal.call_args.kwargs
+        assert call_kwargs["session_name"] == "test-session"
+        assert call_kwargs["new_session"] is False
+
+    def test_create_terminal_session_not_found(self, client):
+        """POST /sessions/{name}/terminals returns 404 for nonexistent session."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal.side_effect = ValueError("Session 'nonexistent' not found")
+
+            response = client.post(
+                "/sessions/nonexistent/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_create_terminal_server_error(self, client):
+        """POST /sessions/{name}/terminals returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal.side_effect = Exception("TMux error")
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 500
+        assert "Failed to create terminal" in response.json()["detail"]
+
+    def test_replay_of_a_failed_create_is_424_with_the_cause(self, client):
+        """Review on PR #773: distinct from a plain 500, so the caller reports
+        the original failure instead of retrying it."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotentCreateFailed("terminal 'a' failed to initialize: boom")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 424
+        assert "failed to initialize: boom" in response.json()["detail"]
+
+    def test_lookup_only_without_a_key_is_400_not_404(self, client):
+        """This endpoint maps ValueError to 404, which would read as a missing
+        session; a lookup with no key is a bad request."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock()
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "lookup_only requires" in response.json()["detail"]
+        mock_svc.create_terminal.assert_not_called()
+
+    def test_lookup_only_is_forwarded_and_a_miss_is_404(self, client):
+        """Review on PR #773: same contract as POST /sessions."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 404
+        assert mock_svc.create_terminal.call_args.kwargs["lookup_only"] is True
+
+    def test_lookup_only_does_not_ask_the_decider(self, client):
+        """Review on PR #773: same contract as POST /sessions."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main._prepare_delegation", new=AsyncMock()
+            ) as decider,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotencyKeyNotFound("no terminal is recorded for 'job-1'")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                    "lookup_only": "true",
+                },
+                json={"delegation_message": "do the task", "delegation_kind": "handoff"},
+            )
+
+        assert response.status_code == 404
+        decider.assert_not_called()
+
+    def test_plain_value_error_still_maps_to_404(self, client):
+        """A plain ``ValueError`` from an in-session create maps to 404 (review on PR #634)."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=ValueError("Session 'test-session' not found")
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 404
+
+    def test_corrupt_terminal_row_is_500_not_404(self, client):
+        """Pin a mapping that rests on the ABSENCE of an arm (review on PR #634).
+
+        A corrupt stored row is a server-data fault, so it must be 500 -- not
+        the 404 this endpoint gives a bare ValueError. `TerminalRecordCorruptError`
+        gets there by NOT being a ValueError and falling to the catch-all, which
+        means no `except` arm asserts this today and adding a narrower one later
+        would silently re-blame the caller for the server's bad data -- the exact
+        defect the commit below this one fixes -- with nothing failing. This test
+        is what fails instead.
+        """
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=TerminalRecordCorruptError("stored row does not validate")
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 500
+
+
+class TestListTerminalsInSession:
+    """Tests for GET /sessions/{session_name}/terminals endpoint."""
+
+    def test_list_terminals_success(self, client):
+        """GET /sessions/{name}/terminals returns terminal list."""
+        mock_terminals = [
+            {
+                "id": "abcd1234",
+                "tmux_session": "s1",
+                "provider": "kiro_cli",
+            },
+            {
+                "id": "abcd5678",
+                "tmux_session": "s1",
+                "provider": "claude_code",
+            },
+        ]
+        with patch(
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+            return_value=mock_terminals,
+        ):
+            response = client.get("/sessions/s1/terminals")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2
+
+    def test_list_terminals_empty(self, client):
+        """GET /sessions/{name}/terminals returns empty list."""
+        with patch(
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+            return_value=[],
+        ):
+            response = client.get("/sessions/empty-session/terminals")
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_list_terminals_server_error(self, client):
+        """GET /sessions/{name}/terminals returns 500 on error."""
+        with patch(
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+            side_effect=Exception("DB error"),
+        ):
+            response = client.get("/sessions/s1/terminals")
+
+        assert response.status_code == 500
+        assert "Failed to list terminals" in response.json()["detail"]
+
+
+# ── Individual terminal endpoints ────────────────────────────────────
+
+
+class TestGetTerminal:
+    """Tests for GET /terminals/{terminal_id} endpoint."""
+
+    def test_get_terminal_success(self, client):
+        """GET /terminals/{id} returns terminal details."""
+        mock_terminal_dict = {
+            "id": "abcd1234",
+            "name": "test-window",
+            "session_name": "test-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+        }
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = mock_terminal_dict
+
+            response = client.get("/terminals/abcd1234")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "abcd1234"
+        assert data["provider"] == "kiro_cli"
+        mock_svc.get_terminal.assert_called_once_with("abcd1234")
+
+    def test_get_terminal_not_found(self, client):
+        """GET /terminals/{id} returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.side_effect = ValueError("Terminal 'deadbeef' not found")
+
+            response = client.get("/terminals/deadbeef")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_get_terminal_server_error(self, client):
+        """GET /terminals/{id} returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.side_effect = Exception("DB error")
+
+            response = client.get("/terminals/abcd1234")
+
+        assert response.status_code == 500
+        assert "Failed to get terminal" in response.json()["detail"]
+
+    def test_get_terminal_invalid_id_format(self, client):
+        """GET /terminals/{id} returns 422 for invalid ID format."""
+        response = client.get("/terminals/not-valid-hex")
+        assert response.status_code == 422
+
+
+def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_path, monkeypatch):
+    """Read surfaces must project stored values, not merely echo mocked payloads."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'terminal-surfaces.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        database,
+        "SessionLocal",
+        sessionmaker(autocommit=False, autoflush=False, bind=engine),
+    )
+
+    database.create_terminal(
+        "abc12345",
+        "surface-session",
+        "worker-1",
+        "codex",
+        agent_profile="worker",
+        model="model-x",
+        model_honored=True,
+    )
+    database.create_terminal(
+        "def67890",
+        "surface-session",
+        "worker-2",
+        "mock_cli",
+        agent_profile="worker",
+        model="ignored-model",
+        model_honored=False,
+    )
+
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    backend.list_sessions.return_value = [{"id": "surface-session"}]
+    monkeypatch.setattr(session_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        terminal_service.status_monitor,
+        "get_status",
+        lambda _terminal_id: MagicMock(value="idle"),
+    )
+
+    def assert_launch_values(terminals):
+        by_id = {terminal["id"]: terminal for terminal in terminals}
+        assert by_id["abc12345"]["model"] == "model-x"
+        assert by_id["abc12345"]["model_honored"] is True
+        assert by_id["def67890"]["model"] == "ignored-model"
+        assert by_id["def67890"]["model_honored"] is False
+
+    assert_launch_values(
+        [
+            terminal_service.get_terminal("abc12345"),
+            terminal_service.get_terminal("def67890"),
+        ]
+    )
+    assert_launch_values(session_service.get_session("surface-session")["terminals"])
+
+    terminal_response = client.get("/terminals/abc12345")
+    ignored_response = client.get("/terminals/def67890")
+    assert terminal_response.status_code == ignored_response.status_code == 200
+    assert_launch_values([terminal_response.json(), ignored_response.json()])
+
+    session_response = client.get("/sessions/surface-session")
+    assert session_response.status_code == 200
+    assert_launch_values(session_response.json()["terminals"])
+
+    terminals_response = client.get("/sessions/surface-session/terminals")
+    assert terminals_response.status_code == 200
+    assert_launch_values(terminals_response.json())
+
+    group_response = client.patch(
+        "/terminals/abc12345/group",
+        json={"group": ["surface"]},
+    )
+    assert group_response.status_code == 200
+    assert_launch_values([group_response.json(), terminal_service.get_terminal("def67890")])
+
+    metadata_response = client.patch(
+        "/terminals/abc12345/metadata",
+        json={"metadata": {"task": "surface-test"}},
+    )
+    assert metadata_response.status_code == 200
+    assert_launch_values([metadata_response.json(), terminal_service.get_terminal("def67890")])
+
+
+class TestSendTerminalInput:
+    """Tests for POST /terminals/{terminal_id}/input endpoint."""
+
+    def test_send_input_success(self, client):
+        """POST /terminals/{id}/input sends the message and names the turn it started."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.dispatch_input.return_value = 11
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "hello world"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        # The dispatch boundary lets the caller tell a status earned for THIS send
+        # from the previous turn's, which is still on screen (#735).
+        assert data["dispatch_boundary"] == 11
+        mock_svc.dispatch_input.assert_called_once_with(
+            "abcd1234",
+            "hello world",
+            registry=ANY,
+            sender_id=None,
+            orchestration_type=None,
+        )
+
+    def test_send_input_with_orchestration_context(self, client):
+        """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.dispatch_input.return_value = 0
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={
+                    "message": "hello world",
+                    "sender_id": "supervisor-1",
+                    "orchestration_type": "assign",
+                },
+            )
+
+        assert response.status_code == 200
+        # A first-ever dispatch has boundary 0; it must still be reported, and
+        # success must not be derived from it.
+        assert response.json() == {"success": True, "dispatch_boundary": 0}
+        mock_svc.dispatch_input.assert_called_once_with(
+            "abcd1234",
+            "hello world",
+            registry=ANY,
+            sender_id="supervisor-1",
+            orchestration_type="assign",
+        )
+
+    def test_send_input_reports_no_boundary_for_event_inbox_backends(self, client):
+        """An event-inbox backend (herdr) never advances the output generation,
+        so ``dispatch_input`` always returns the meaningless int 0. Naming it
+        would make `cao session send` skip its 3-second grace sleep while the
+        GET-side gate stays inert for herdr (status_generation is None there)
+        -- the pre-#735 stale window, widened. The endpoint must report no
+        boundary at all so the CLI falls back to the flat sleep (#735 synthesis
+        item 2)."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_get_backend,
+        ):
+            mock_svc.dispatch_input.return_value = 0
+            mock_get_backend.return_value.supports_event_inbox.return_value = True
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "hello world"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "dispatch_boundary": None}
+
+    def test_send_input_terminal_not_found(self, client):
+        """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.dispatch_input.side_effect = ValueError("Terminal not found")
+
+            response = client.post(
+                "/terminals/deadbeef/input",
+                params={"message": "hello"},
+            )
+
+        assert response.status_code == 404
+        assert "Terminal not found" in response.json()["detail"]
+
+    def test_send_input_blocked_returns_conflict(self, client):
+        """POST /terminals/{id}/input returns 409 for protected interactive prompts."""
+        from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
+            mock_svc.dispatch_input.side_effect = TerminalInputBlockedError(
+                "Terminal abcd1234 is waiting for a user answer"
+            )
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "new task", "orchestration_type": "assign"},
+            )
+
+        assert response.status_code == 409
+        assert "waiting for a user answer" in response.json()["detail"]
+
+    def test_send_input_server_error(self, client):
+        """POST /terminals/{id}/input returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.dispatch_input.side_effect = Exception("TMux send failed")
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "hello"},
+            )
+
+        assert response.status_code == 500
+        assert "Failed to send input" in response.json()["detail"]
+
+
+class TestSendTerminalKey:
+    """Tests for POST /terminals/{terminal_id}/key endpoint."""
+
+    def test_send_key_success(self, client):
+        """POST /terminals/{id}/key sends an allowed tmux key."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.return_value = True
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Down"})
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        mock_svc.send_special_key.assert_called_once_with("abcd1234", "Down")
+
+    @pytest.mark.parametrize("key", ["", "C-C-C", "send-prefix", "C-;"])
+    def test_send_key_rejects_malformed_key_name(self, client, key):
+        """POST /terminals/{id}/key rejects malformed or unsupported key names."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.post("/terminals/abcd1234/key", params={"key": key})
+
+        assert response.status_code == 400
+        assert "Invalid tmux key name" in response.json()["detail"]
+        mock_svc.send_special_key.assert_not_called()
+
+    def test_send_key_terminal_not_found(self, client):
+        """POST /terminals/{id}/key returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ValueError("Terminal not found")
+
+            response = client.post("/terminals/deadbeef/key", params={"key": "Enter"})
+
+        assert response.status_code == 404
+        assert "Terminal not found" in response.json()["detail"]
+
+    def test_send_key_server_error(self, client):
+        """POST /terminals/{id}/key returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = Exception("TMux send failed")
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 500
+        assert "Failed to send key" in response.json()["detail"]
+
+    def test_send_key_refused_terminal_is_409(self, client):
+        """POST /terminals/{id}/key returns 409, not 500, for a refused terminal.
+
+        A special key is typed input (#1074): a Kiro terminal CAO has not
+        verified refuses it the same way /input does.
+        """
+        from cli_agent_orchestrator.models.terminal import ProviderExitedInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ProviderExitedInputBlockedError(
+                "Terminal abcd1234 failed deferred initialization (identity_mismatch). "
+                "Refusing to deliver input."
+            )
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 409
+        assert "Refusing to deliver input" in response.json()["detail"]
+
+
+class TestGetTerminalOutput:
+    """Tests for GET /terminals/{terminal_id}/output endpoint."""
+
+    def test_get_output_full_mode(self, client):
+        """GET /terminals/{id}/output returns full output by default."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.return_value = "Hello from terminal"
+
+            response = client.get("/terminals/abcd1234/output")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["output"] == "Hello from terminal"
+        assert data["mode"] == "full"
+
+    def test_get_output_last_mode(self, client):
+        """GET /terminals/{id}/output with mode=last returns last response."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.return_value = "Last response"
+
+            response = client.get("/terminals/abcd1234/output?mode=last")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["output"] == "Last response"
+        assert data["mode"] == "last"
+
+    def test_get_output_terminal_not_found(self, client):
+        """GET /terminals/{id}/output returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = ValueError("Terminal not found")
+
+            response = client.get("/terminals/deadbeef/output")
+
+        assert response.status_code == 404
+        assert "Terminal not found" in response.json()["detail"]
+
+    def test_get_output_server_error(self, client):
+        """GET /terminals/{id}/output returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = Exception("Read failed")
+
+            response = client.get("/terminals/abcd1234/output")
+
+        assert response.status_code == 500
+        assert "Failed to get output" in response.json()["detail"]
+
+    def test_get_output_last_mode_extraction_failure_is_500(self, client):
+        """A missing response marker is a 500, not a 404 (issue #570).
+
+        mode=last takes the pinned-depth retry path that re-raises as
+        OutputExtractionError; it subclasses ValueError, so without an arm
+        ordered before the ValueError catch below it collapsed back into this
+        route's 404. Same boundary mapping as POST /terminals/run-step.
+        """
+        from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = OutputExtractionError(
+                "No completion marker found after last user message"
+            )
+
+            response = client.get("/terminals/abcd1234/output?mode=last")
+
+        assert response.status_code == 500
+        assert "No completion marker" in response.json()["detail"]
+
+
+class TestDeleteTerminal:
+    """Tests for DELETE /terminals/{terminal_id} endpoint."""
+
+    def test_delete_terminal_success(self, client):
+        """DELETE /terminals/{id} deletes terminal successfully."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = True
+
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        mock_svc.delete_terminal.assert_called_once_with(
+            "abcd1234", registry=ANY, end_reason="deleted"
+        )
+
+    def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
+        """HTTP 200 + success:false would hide a still-retryable Grok home."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = False
+
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 409
+        assert "cleanup deferred" in response.json()["detail"]
+        assert "abcd1234" in response.json()["detail"]
+
+    def test_delete_terminal_not_found(self, client):
+        """DELETE /terminals/{id} returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
+
+            response = client.delete("/terminals/deadbeef")
+
+        assert response.status_code == 404
+        assert "Terminal not found" in response.json()["detail"]
+
+    def test_delete_terminal_server_error(self, client):
+        """DELETE /terminals/{id} returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = Exception("Cleanup failed")
+
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 500
+        assert "Failed to delete terminal" in response.json()["detail"]
+
+
+# ── flow_daemon ──────────────────────────────────────────────────────
+
+
+class TestFlowDaemon:
+    """Tests for the flow_daemon() background task."""
+
+    @pytest.mark.asyncio
+    async def test_flow_daemon_executes_flows(self):
+        """flow_daemon fetches and executes due flows."""
+        mock_flow = MagicMock()
+        mock_flow.name = "test-flow"
+
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.get_flows_to_run.return_value = [mock_flow]
+            mock_svc.execute_flow.return_value = True
+
+            # Run one iteration then cancel
+            with patch("asyncio.sleep", side_effect=asyncio.CancelledError):
+                with pytest.raises(asyncio.CancelledError):
+                    await flow_daemon()
+
+            mock_svc.get_flows_to_run.assert_called_once()
+            mock_svc.execute_flow.assert_called_once_with("test-flow")
+
+    @pytest.mark.asyncio
+    async def test_flow_daemon_handles_execute_error(self):
+        """flow_daemon handles errors from execute_flow gracefully."""
+        mock_flow = MagicMock()
+        mock_flow.name = "fail-flow"
+
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.get_flows_to_run.return_value = [mock_flow]
+            mock_svc.execute_flow.side_effect = Exception("Execution failed")
+
+            with patch("asyncio.sleep", side_effect=asyncio.CancelledError):
+                with pytest.raises(asyncio.CancelledError):
+                    await flow_daemon()
+
+            # Should still have attempted execution
+            mock_svc.execute_flow.assert_called_once_with("fail-flow")
+
+    @pytest.mark.asyncio
+    async def test_flow_daemon_handles_get_flows_error(self):
+        """flow_daemon handles errors from get_flows_to_run gracefully."""
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.get_flows_to_run.side_effect = Exception("DB error")
+
+            with patch("asyncio.sleep", side_effect=asyncio.CancelledError):
+                with pytest.raises(asyncio.CancelledError):
+                    await flow_daemon()
+
+            mock_svc.get_flows_to_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_flow_daemon_skipped_flow(self):
+        """flow_daemon logs when execute returns False (skipped)."""
+        mock_flow = MagicMock()
+        mock_flow.name = "skipped-flow"
+
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.get_flows_to_run.return_value = [mock_flow]
+            mock_svc.execute_flow.return_value = False
+
+            with patch("asyncio.sleep", side_effect=asyncio.CancelledError):
+                with pytest.raises(asyncio.CancelledError):
+                    await flow_daemon()
+
+            mock_svc.execute_flow.assert_called_once_with("skipped-flow")
+
+    @pytest.mark.asyncio
+    async def test_flow_daemon_multiple_flows(self):
+        """flow_daemon processes multiple flows in one iteration."""
+        flow1 = MagicMock()
+        flow1.name = "flow-1"
+        flow2 = MagicMock()
+        flow2.name = "flow-2"
+
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.get_flows_to_run.return_value = [flow1, flow2]
+            mock_svc.execute_flow.return_value = True
+
+            with patch("asyncio.sleep", side_effect=asyncio.CancelledError):
+                with pytest.raises(asyncio.CancelledError):
+                    await flow_daemon()
+
+            assert mock_svc.execute_flow.call_count == 2
+
+
+class TestOpenCodeInboxDeliveryDaemon:
+    """Tests for the OpenCode inbox delivery poller task."""
+
+    @pytest.mark.asyncio
+    async def test_poller_runs_one_iteration_then_cancels(self):
+        """Poller sleeps, runs the sync poll in a thread, then handles cancellation."""
+        sleep_calls = 0
+        registry = MagicMock()
+        mock_to_thread = AsyncMock()
+
+        async def fake_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch("asyncio.sleep", new=fake_sleep),
+            patch("asyncio.to_thread", mock_to_thread),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await opencode_inbox_delivery_daemon(registry)
+
+        mock_to_thread.assert_awaited_once()
+        assert mock_to_thread.await_args.args[1] is registry
+
+
+class TestInboxReconciliationDaemon:
+    """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_runs_one_iteration_then_cancels(self):
+        """Daemon sleeps, runs the sync sweep in a thread, then handles cancellation."""
+        sleep_calls = 0
+        registry = MagicMock()
+        mock_to_thread = AsyncMock()
+
+        async def fake_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch("asyncio.sleep", new=fake_sleep),
+            patch("asyncio.to_thread", mock_to_thread),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await inbox_reconciliation_daemon(registry)
+
+        # Each iteration dispatches the inbox reconcile, then the delegation
+        # callback sweep. Both are sync work and must run off the loop.
+        assert mock_to_thread.await_count == 2
+        first, second = mock_to_thread.await_args_list
+        # reconcile_orphaned_messages is a bound method on the singleton now, so a
+        # fresh attribute access is a distinct object — compare by value, not id.
+        assert first.args[0] == inbox_service.reconcile_orphaned_messages
+        assert first.args[1] is registry
+        assert second.args[0] == delegation_callback_service.sweep
+        assert second.args[1] is registry
+
+
+# ── lifespan ─────────────────────────────────────────────────────────
+
+
+class TestLifespan:
+    """Tests for the lifespan() context manager."""
+
+    @pytest.mark.asyncio
+    async def test_lifespan_startup_and_shutdown(self):
+        """lifespan starts the event-bus consumers on entry, cleans up on exit.
+
+        The watchdog PollingObserver inbox watcher was replaced by event-bus
+        consumers: startup registers the running loop with the event bus
+        (``bus.set_loop``) and spins up StatusMonitor/LogWriter/InboxService as
+        background tasks (plus the flow daemon and OpenCode inbox poller). On
+        exit the plugin registry is torn down.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.api.main import lifespan
+
+        async def fake_daemon():
+            await asyncio.sleep(3600)
+
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        mock_load = AsyncMock()
+        mock_teardown = AsyncMock()
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch("cli_agent_orchestrator.api.main._seed_default_skills_at_startup") as mock_seed,
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
+            patch(
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
+            ),
+            patch("cli_agent_orchestrator.api.main.bus") as mock_bus,
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", mock_load),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", mock_teardown),
+        ):
+            async with lifespan(app):
+                # Inside the lifespan — startup completed.
+                mock_seed.assert_called_once_with()
+                # The registry was loaded and stored on app state.
+                mock_load.assert_awaited_once()
+                assert app.state.plugin_registry is not None
+                # The event loop was registered with the event bus so the
+                # thread-safe publishers can reach the asyncio consumers.
+                mock_bus.set_loop.assert_called_once()
+                loop_arg = mock_bus.set_loop.call_args.args[0]
+                assert loop_arg is asyncio.get_running_loop()
+
+            # After exit — shutdown tears down the plugin registry.
+            mock_teardown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_cancels_inbox_reconciliation_on_shutdown(self):
+        """The reconciliation sweep task is cancelled when the server stops (issue #131).
+
+        The watchdog PollingObserver is gone in the event-driven model, so the
+        event-bus consumers are stubbed (as in the startup/shutdown test) and the
+        reconciliation daemon is replaced with one that records its cancellation.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.api.main import lifespan
+
+        reconcile_cancelled = {"value": False}
+
+        async def fake_daemon():
+            await asyncio.sleep(3600)
+
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def fake_reconcile(_registry):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                reconcile_cancelled["value"] = True
+                raise
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
+            patch(
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_reconciliation_daemon",
+                fake_reconcile,
+            ),
+            patch("cli_agent_orchestrator.api.main.bus"),
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", new=AsyncMock()),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", new=AsyncMock()),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert reconcile_cancelled["value"] is True
+
+
+# ── main() entry point ───────────────────────────────────────────────
+
+
+class TestMainEntryPoint:
+    """Tests for the main() CLI entry point."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_environ(self):
+        """main() writes CAO_API_HOST/PORT (and CAO_AGENTS_DIR) straight into
+        os.environ to mirror the real CLI entry point, which leaks into every
+        test that runs later in the same process. Snapshot and restore it so
+        these tests stay self-contained."""
+        with patch.dict(os.environ):
+            yield
+
+    def test_main_default_args(self):
+        """main() runs uvicorn with default host/port."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_uvicorn.assert_called_once()
+            call_kwargs = mock_uvicorn.call_args
+            # Should use SERVER_HOST and SERVER_PORT defaults
+            assert call_kwargs[0][0] is app
+
+    def test_main_custom_host_port(self):
+        """main() uses custom host and port from args."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_uvicorn.assert_called_once()
+            call_kwargs = mock_uvicorn.call_args.kwargs
+            assert mock_uvicorn.call_args.args[0] is app
+            assert call_kwargs["host"] == "0.0.0.0"
+            assert call_kwargs["port"] == 9999
+            assert call_kwargs["proxy_headers"] is True
+            assert "forwarded_allow_ips" in call_kwargs
+
+    def test_main_custom_host_port_exports_to_environ(self, monkeypatch):
+        """P2-2: ``--host``/``--port`` must land in ``os.environ`` the same way
+        ``--agents-dir`` already does, so ``cao_server_env()`` (read by the MCP
+        env forwarding) sees this launch's actual address instead of whatever
+        was there before (or the 9889 default). A wildcard bind is mapped to
+        loopback since it isn't a usable client address."""
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_API_PORT", raising=False)
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_HOST"] == "127.0.0.1"
+            assert os.environ["CAO_API_PORT"] == "9999"
+
+    def test_main_without_flags_does_not_touch_environ(self, monkeypatch):
+        """The env-var path (no CLI flags) already works because
+        ``cao_server_env()`` reads ``os.environ`` directly -- ``main()`` must
+        not overwrite it when no flag was given."""
+        monkeypatch.setenv("CAO_API_HOST", "10.0.0.5")
+        monkeypatch.setenv("CAO_API_PORT", "7000")
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_HOST"] == "10.0.0.5"
+            assert os.environ["CAO_API_PORT"] == "7000"
+
+    def test_main_flag_port_overrides_a_stale_env_var(self, monkeypatch):
+        """Mixed launch (``CAO_API_PORT=9899 cao-server --port 9900``): the
+        flag must win in the forwarded env too, not just in ``app.state``."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=9900, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert os.environ["CAO_API_PORT"] == "9900"
+
+    def test_main_with_agents_dir(self):
+        """main() sets KIRO_AGENTS_DIR when --agents-dir is provided."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.constants.KIRO_AGENTS_DIR") as _,
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir="/custom/agents", host=None, port=None, terminal=None
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+            # No assertion needed beyond no exception — the code path is covered
+
+    def test_main_extends_cors_for_custom_host_port(self):
+        """``main()`` must call ``add_local_cors_origins`` with the resolved
+        host/port *before* uvicorn starts, otherwise the same-host browser
+        access promised by issue #151 silently regresses. ``uvicorn.run`` is
+        blocking in real execution, so any mutation of ``CORS_ORIGINS`` after
+        it would be unreachable on first request — the order assertion below
+        guards against an accidental reorder of those two lines."""
+        parent = Mock()
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.add_local_cors_origins") as mock_add,
+        ):
+            parent.attach_mock(mock_add, "add_cors")
+            parent.attach_mock(mock_uvicorn, "uvicorn_run")
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert parent.mock_calls == [
+                call.add_cors("0.0.0.0", 9999),
+                call.uvicorn_run(
+                    app,
+                    host="0.0.0.0",
+                    port=9999,
+                    proxy_headers=True,
+                    forwarded_allow_ips=parent.uvicorn_run.call_args.kwargs["forwarded_allow_ips"],
+                ),
+            ]
+
+    def test_main_terminal_flag_overrides_backend(self):
+        """--terminal sets the backend via the factory before the server starts."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host=None, port=None, terminal="herdr"
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_create.assert_called_once_with(backend_override="herdr")
+            mock_set.assert_called_once_with(mock_create.return_value)
+
+    def test_main_no_terminal_flag_leaves_backend_lazy(self):
+        """Without --terminal, main() does not eagerly set the backend."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_set.assert_not_called()
