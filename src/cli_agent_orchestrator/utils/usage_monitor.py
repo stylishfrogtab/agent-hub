@@ -87,7 +87,9 @@ def check(state_path: Optional[Path] = None, path: Optional[Path] = None) -> Lis
     for window, percent in read_usage(path).items():
         sent = list(sent_all.get(window, []))
         for threshold in due_alerts(window, percent, sent):
-            messages.append(f"Claude {window.replace('_', ' ')} usage at {percent:.0f}% (over {threshold}%)")
+            messages.append(
+                f"Claude {window.replace('_', ' ')} usage at {percent:.0f}% (over {threshold}%)"
+            )
         sent_all[window] = sent
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(sent_all))
@@ -96,7 +98,9 @@ def check(state_path: Optional[Path] = None, path: Optional[Path] = None) -> Lis
 
 def notify_macos(title: str, message: str) -> None:
     """Show a macOS notification. Arguments are passed as argv, never through a shell."""
-    script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
+    script = (
+        "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
+    )
     subprocess.run(["osascript", "-e", script, title, message], check=False)
 
 
