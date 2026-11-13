@@ -58,6 +58,7 @@ from cli_agent_orchestrator.utils.delegation import (
     describe_rejection,
     tools_exceeding,
 )
+from cli_agent_orchestrator.utils.delegation_brief import check_delegation_brief
 from cli_agent_orchestrator.utils.description import normalize_description
 from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.terminal import (
@@ -2953,6 +2954,9 @@ def _assign_impl(
         return {"success": False, "terminal_id": None, "message": refusal}
 
     canonical_message = message if delegation_message is None else delegation_message
+    brief_refusal = check_delegation_brief(canonical_message)
+    if brief_refusal:
+        return {"success": False, "terminal_id": None, "message": brief_refusal}
     notes: list[str] = []
     terminal_id: Optional[str] = None
     claim: Optional[EphemeralClaim] = None
